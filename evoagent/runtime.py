@@ -26,6 +26,10 @@ class RuntimeCancelled(RuntimeError):
     """The owning task requested cancellation."""
 
 
+class RuntimeStaleRun(RuntimeError):
+    """A queued worker lost ownership of the task execution token."""
+
+
 class AgentLoopProtocolError(RuntimeError):
     """An agent returned an invalid loop action."""
 
@@ -144,10 +148,15 @@ class AgentRuntime:
     def execute(
         self, initial_state: Dict[str, Any], nodes: Iterable[RuntimeNode],
         task_id: str = "", checkpoint_store=None,
+        checkpoint_fingerprints: Optional[Mapping[str, str]] = None,
+        run_token: str = "",
+        claim_token: str = "",
         cancel_check: Optional[Callable[[], bool]] = None,
         event_sink: Optional[Callable[[RuntimeEvent], None]] = None,
         span_factory: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
-        non_retryable: Tuple[type, ...] = (ValueError, RuntimeCancelled, RuntimeBudgetExceeded),
+        non_retryable: Tuple[type, ...] = (
+            ValueError, RuntimeCancelled, RuntimeBudgetExceeded, RuntimeStaleRun,
+        ),
     ) -> Dict[str, Any]:
         state = dict(initial_state)
         started = time.monotonic()
@@ -156,6 +165,7 @@ class AgentRuntime:
             checkpoint_store.load_checkpoints(task_id)
             if checkpoint_store is not None and task_id else {}
         )
+        checkpoint_fingerprints = dict(checkpoint_fingerprints or {})
 
         def emit(kind: str, node: str, attempt: int = 0, **detail) -> None:
             if event_sink:
@@ -171,11 +181,20 @@ class AgentRuntime:
 
         for node in nodes:
             cached = checkpoints.get(node.name) if node.checkpoint else None
-            if cached and cached.get("status") == "completed":
+            has_fingerprint = node.name in checkpoint_fingerprints
+            fingerprint = checkpoint_fingerprints.get(node.name, "")
+            if cached and cached.get("status") == "completed" and (
+                not has_fingerprint or (
+                    fingerprint and cached.get("fingerprint") == fingerprint
+                )
+            ):
                 output = dict(cached.get("state") or {})
                 state.update(output)
                 emit("checkpoint_restored", node.name, int(cached.get("attempt", 0)))
                 continue
+            if (cached and cached.get("status") == "completed" and node.checkpoint
+                    and has_fingerprint):
+                emit("checkpoint_invalidated", node.name, int(cached.get("attempt", 0)))
 
             retries = self.node_retries if node.retries is None else node.retries
             previous_attempt = int((cached or {}).get("attempt", 0))
@@ -200,9 +219,13 @@ class AgentRuntime:
                         raise TypeError("runtime node %s must return a dict" % node.name)
                     state.update(output)
                     if checkpoint_store is not None and task_id and node.checkpoint:
-                        checkpoint_store.save_checkpoint(
-                            task_id, node.name, output, "completed", attempt
+                        saved = checkpoint_store.save_checkpoint(
+                            task_id, node.name, output, "completed", attempt,
+                            fingerprint=fingerprint, run_token=run_token,
+                            claim_token=claim_token,
                         )
+                        if saved is False:
+                            raise RuntimeStaleRun("task execution was superseded")
                     emit("node_completed", node.name, attempt, output_keys=sorted(output))
                     last_error = None
                     break
@@ -211,9 +234,13 @@ class AgentRuntime:
                 except Exception as exc:
                     last_error = exc
                     if checkpoint_store is not None and task_id and node.checkpoint:
-                        checkpoint_store.save_checkpoint(
-                            task_id, node.name, {}, "failed", attempt, str(exc)
+                        saved = checkpoint_store.save_checkpoint(
+                            task_id, node.name, {}, "failed", attempt, str(exc),
+                            fingerprint=fingerprint, run_token=run_token,
+                            claim_token=claim_token,
                         )
+                        if saved is False:
+                            raise RuntimeStaleRun("task execution was superseded")
                     emit(
                         "node_failed", node.name, attempt,
                         error=str(exc)[:1000], will_retry=offset <= retries,

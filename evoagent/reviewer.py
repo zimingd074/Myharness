@@ -20,6 +20,7 @@ class Reviewer(ABC):
 
 class LocalRuleReviewer(Reviewer):
     name = "local-rules"
+    RULESET_REVISION = "1"
     domains = ("security", "reliability", "correctness")
 
     RULES = [
@@ -141,6 +142,7 @@ class DomainRuleReviewer(Reviewer):
 
 class SecurityRuleReviewer(DomainRuleReviewer):
     name = "security-agent"
+    RULESET_REVISION = "1"
     domains = ("security", "authorization")
     rule_ids = frozenset({
         "SEC-EVAL", "SEC-SUBPROCESS-SHELL", "SEC-HARDCODED-SECRET",
@@ -150,6 +152,7 @@ class SecurityRuleReviewer(DomainRuleReviewer):
 
 class ReliabilityRuleReviewer(DomainRuleReviewer):
     name = "reliability-agent"
+    RULESET_REVISION = "1"
     domains = ("reliability", "correctness", "regression")
     rule_ids = frozenset({"REL-EMPTY-EXCEPT", "REL-DEBUG-PRINT"})
 
