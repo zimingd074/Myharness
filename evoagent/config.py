@@ -78,7 +78,7 @@ class Settings:
     github_token: str
     auto_post_review: bool
     database_url: str = ""
-    redis_url: str = ""
+    rocketmq_nameserver: str = ""
     async_workers: int = 2
     agent_max_workers: int = 4
     agent_retries: int = 1
@@ -249,7 +249,7 @@ class Settings:
             github_token=os.getenv("EVOAGENT_GITHUB_TOKEN", ""),
             auto_post_review=_bool("EVOAGENT_AUTO_POST_REVIEW"),
             database_url=os.getenv("EVOAGENT_DATABASE_URL", ""),
-            redis_url=os.getenv("EVOAGENT_REDIS_URL", ""),
+            rocketmq_nameserver=os.getenv("EVOAGENT_ROCKETMQ_NAMESERVER", ""),
             async_workers=_int("EVOAGENT_ASYNC_WORKERS", 2),
             agent_max_workers=_int("EVOAGENT_AGENT_MAX_WORKERS", 4),
             agent_retries=_non_negative_int("EVOAGENT_AGENT_RETRIES", 1),
@@ -271,7 +271,11 @@ class Settings:
             github_private_key_path=os.getenv("EVOAGENT_GITHUB_PRIVATE_KEY_PATH", ""),
             public_base_url=os.getenv("EVOAGENT_PUBLIC_BASE_URL", "http://127.0.0.1:8080").rstrip("/"),
             llm_provider=os.getenv("EVOAGENT_LLM_PROVIDER", "local"),
-            deepseek_api_key=os.getenv("EVOAGENT_DEEPSEEK_API_KEY", ""),
+            # Accept the provider-standard name too, while keeping the
+            # namespaced application setting as the explicit override.
+            deepseek_api_key=os.getenv(
+                "EVOAGENT_DEEPSEEK_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")
+            ),
             openrouter_api_key=os.getenv("EVOAGENT_OPENROUTER_API_KEY", ""),
             openrouter_site_url=os.getenv("EVOAGENT_OPENROUTER_SITE_URL", ""),
             openrouter_app_name=os.getenv("EVOAGENT_OPENROUTER_APP_NAME", "EvoAgent"),

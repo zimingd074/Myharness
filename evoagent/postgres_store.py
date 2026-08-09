@@ -113,6 +113,9 @@ class PostgresTaskStore:
                 severity TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
                 created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
                 UNIQUE(tenant_id,alert_key,status))""",
+            """CREATE TABLE IF NOT EXISTS queue_dead_letters (
+                message_id TEXT PRIMARY KEY, payload_json JSONB NOT NULL,
+                error TEXT NOT NULL, failed_at TIMESTAMPTZ NOT NULL)""",
             """CREATE TABLE IF NOT EXISTS agent_memories (
                 id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
                 task_id TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT '',
@@ -868,6 +871,34 @@ class PostgresTaskStore:
                 (tenant_id, max(1, min(limit, 500))),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_dead_letter(self, message_id: str, payload: Dict[str, Any], error: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO queue_dead_letters(message_id,payload_json,error,failed_at) "
+                "VALUES (%s,%s::jsonb,%s,%s) ON CONFLICT(message_id) DO UPDATE SET "
+                "payload_json=EXCLUDED.payload_json,error=EXCLUDED.error,failed_at=EXCLUDED.failed_at",
+                (message_id, json.dumps(payload, ensure_ascii=False), error[:2000], utc_now()),
+            )
+
+    def list_dead_letters(self, limit: int = 100) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM queue_dead_letters ORDER BY failed_at DESC LIMIT %s",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dead_letter(self, message_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM queue_dead_letters WHERE message_id=%s", (message_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def remove_dead_letter(self, message_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM queue_dead_letters WHERE message_id=%s", (message_id,))
 
     def save_installation(
         self, installation_id: int, account_login: str, tenant_id: str = "default"

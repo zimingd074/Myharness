@@ -1,12 +1,10 @@
-"""Durable task delivery with ACK, leases, retry backoff and a dead-letter queue."""
+"""Durable task delivery with RocketMQ ACK, retry, and dead-letter support."""
 import json
-import queue
-import socket
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Dict, Optional
 
 
 class PermanentTaskError(RuntimeError):
@@ -14,130 +12,120 @@ class PermanentTaskError(RuntimeError):
 
 
 class TaskQueue:
-    STREAM = "evoagent:review:stream"
-    DLQ = "evoagent:review:dlq"
+    TOPIC = "EvoAgentReview"
+    DLQ_TOPIC = "EvoAgentReviewDLQ"
     GROUP = "evoagent-workers"
 
     def __init__(
-        self, handler: Callable[[Dict[str, Any]], None], workers: int = 2,
-        redis_url: str = "", max_attempts: int = 3, lease_seconds: int = 60,
-        on_dead_letter: Optional[Callable[[Dict[str, Any], str], None]] = None,
+        self, handler: Callable[[Dict], None], workers: int = 2,
+        rocketmq_nameserver: str = "", max_attempts: int = 3,
+        lease_seconds: int = 60,
+        on_dead_letter: Optional[Callable[[Dict, str], None]] = None,
     ):
         self.handler = handler
-        self.redis_url = redis_url
         self.max_attempts = max_attempts
+        # RocketMQ's broker owns the in-flight lease.  Keep this setting so the
+        # existing configuration remains meaningful in the memory fallback.
         self.lease_seconds = lease_seconds
         self.on_dead_letter = on_dead_letter
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="evoagent-worker")
-        self._redis = None
-        self._memory: queue.Queue = queue.Queue()
         self._memory_dlq = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self.consumer = "%s-%s" % (socket.gethostname(), uuid.uuid4().hex[:8])
-        if redis_url:
-            try:
-                import redis
-            except ImportError as exc:
-                raise RuntimeError("Redis mode requires: pip install redis") from exc
-            self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
-            self._redis.ping()
-            try:
-                self._redis.xgroup_create(self.STREAM, self.GROUP, id="0", mkstream=True)
-            except redis.ResponseError as exc:
-                if "BUSYGROUP" not in str(exc):
-                    raise
-            for _ in range(workers):
-                self._executor.submit(self._redis_worker)
+        self._consumer = None
+        self._producer = None
+        if rocketmq_nameserver:
+            self._start_rocketmq(rocketmq_nameserver, workers)
+
+    def _start_rocketmq(self, nameserver: str, workers: int) -> None:
+        try:
+            from rocketmq.client import ConsumeStatus, Producer, PushConsumer
+        except ImportError as exc:
+            raise RuntimeError(
+                "RocketMQ mode requires rocketmq-client-python and librocketmq"
+            ) from exc
+        self._consume_success = ConsumeStatus.CONSUME_SUCCESS
+        self._reconsume_later = ConsumeStatus.RECONSUME_LATER
+        self._producer = Producer("evoagent-dlq-producer")
+        self._producer.set_name_server_address(nameserver)
+        self._producer.start()
+        self._consumer = PushConsumer(self.GROUP)
+        self._consumer.set_name_server_address(nameserver)
+        self._consumer.set_thread_count(workers)
+        self._consumer.subscribe(self.TOPIC, self._rocketmq_callback)
+        self._consumer.start()
 
     @property
     def backend(self) -> str:
-        return "redis-streams" if self._redis else "memory-acked"
+        return "rocketmq" if self._consumer else "memory-acked"
 
-    def submit(self, payload: Dict[str, Any], message_id: str = "") -> str:
+    def submit(self, payload: Dict, message_id: str = "") -> str:
         envelope = {
             "message_id": message_id or str(payload.get("task_id") or uuid.uuid4()),
-            "attempt": 0,
             "payload": payload,
             "submitted_at": time.time(),
         }
-        if self._redis:
-            self._redis.xadd(self.STREAM, {"envelope": json.dumps(envelope, ensure_ascii=False)})
+        if self._producer:
+            self._send(self.TOPIC, envelope)
         else:
-            self._executor.submit(self._deliver, envelope)
+            self._executor.submit(self._deliver_memory, envelope, 1)
         return envelope["message_id"]
 
-    def _deliver(self, envelope: Dict[str, Any]) -> bool:
-        envelope["attempt"] = int(envelope.get("attempt", 0)) + 1
+    def _send(self, topic: str, envelope: Dict) -> None:
+        from rocketmq.client import Message
+
+        message = Message(topic)
+        message.set_keys(str(envelope["message_id"]))
+        message.set_body(json.dumps(envelope, ensure_ascii=False).encode("utf-8"))
+        self._producer.send_sync(message)
+
+    def _rocketmq_callback(self, message):
+        try:
+            envelope = json.loads(message.body.decode("utf-8"))
+            if not isinstance(envelope, dict) or "payload" not in envelope:
+                raise ValueError("queue envelope must contain payload")
+        except Exception as exc:
+            self._dead_letter({"message_id": message.id, "payload": {}},
+                              "invalid queue envelope: %s" % exc)
+            return self._consume_success
+        attempt = int(message.reconsume_times) + 1
         try:
             self.handler(envelope["payload"])
-            return True
+            return self._consume_success
         except PermanentTaskError as exc:
-            self._dead_letter(envelope, str(exc))
-            return False
+            self._dead_letter(envelope, str(exc), attempt)
+            return self._consume_success
         except Exception as exc:
-            if envelope["attempt"] >= self.max_attempts:
-                self._dead_letter(envelope, str(exc))
-            elif self._redis:
-                self._redis.xadd(self.STREAM, {
-                    "envelope": json.dumps(envelope, ensure_ascii=False)
-                })
-            else:
-                delay = min(2 ** (envelope["attempt"] - 1), 10)
-                timer = threading.Timer(delay, self._submit_memory, args=(envelope,))
-                timer.daemon = True
-                timer.start()
-            return False
+            if attempt >= self.max_attempts:
+                self._dead_letter(envelope, str(exc), attempt)
+                return self._consume_success
+            return self._reconsume_later
 
-    def _submit_memory(self, envelope: Dict[str, Any]) -> None:
-        if not self._stop.is_set():
-            self._executor.submit(self._deliver, envelope)
-
-    def _redis_worker(self) -> None:
-        while not self._stop.is_set():
-            self._reclaim_stale()
-            messages = self._redis.xreadgroup(
-                self.GROUP, self.consumer, {self.STREAM: ">"}, count=1, block=1000
-            )
-            for _stream, entries in messages:
-                for redis_id, fields in entries:
-                    try:
-                        envelope = json.loads(fields["envelope"])
-                    except Exception as exc:
-                        envelope = {
-                            "message_id": redis_id, "attempt": self.max_attempts,
-                            "payload": {}, "submitted_at": time.time(),
-                        }
-                        self._dead_letter(envelope, "invalid queue envelope: %s" % exc)
-                        self._redis.xack(self.STREAM, self.GROUP, redis_id)
-                        continue
-                    try:
-                        self._deliver(envelope)
-                        # ACK only after work completed or was safely requeued/DLQed.
-                        self._redis.xack(self.STREAM, self.GROUP, redis_id)
-                    except Exception:
-                        # Infrastructure failure: leave pending for lease recovery.
-                        continue
-
-    def _reclaim_stale(self) -> None:
+    def _deliver_memory(self, envelope: Dict, attempt: int) -> None:
         try:
-            result = self._redis.xautoclaim(
-                self.STREAM, self.GROUP, self.consumer,
-                min_idle_time=self.lease_seconds * 1000, start_id="0-0", count=10,
-            )
-            entries = result[1] if len(result) > 1 else []
-            for redis_id, fields in entries:
-                envelope = json.loads(fields["envelope"])
-                self._deliver(envelope)
-                self._redis.xack(self.STREAM, self.GROUP, redis_id)
-        except Exception:
-            # Redis versions without XAUTOCLAIM still process new entries.
-            return
+            self.handler(envelope["payload"])
+        except PermanentTaskError as exc:
+            self._dead_letter(envelope, str(exc), attempt)
+        except Exception as exc:
+            if attempt >= self.max_attempts:
+                self._dead_letter(envelope, str(exc), attempt)
+                return
+            delay = min(2 ** (attempt - 1), 10)
+            timer = threading.Timer(delay, self._submit_memory, args=(envelope, attempt + 1))
+            timer.daemon = True
+            timer.start()
 
-    def _dead_letter(self, envelope: Dict[str, Any], error: str) -> None:
-        item = {**envelope, "error": error[:2000], "failed_at": time.time()}
-        if self._redis:
-            self._redis.xadd(self.DLQ, {"envelope": json.dumps(item, ensure_ascii=False)})
+    def _submit_memory(self, envelope: Dict, attempt: int) -> None:
+        if not self._stop.is_set():
+            self._executor.submit(self._deliver_memory, envelope, attempt)
+
+    def _dead_letter(self, envelope: Dict, error: str, attempt: int = 1) -> None:
+        item = {
+            **envelope, "attempt": attempt, "error": error[:2000],
+            "failed_at": time.time(),
+        }
+        if self._producer:
+            self._send(self.DLQ_TOPIC, item)
         else:
             with self._lock:
                 self._memory_dlq.append(item)
@@ -145,20 +133,20 @@ class TaskQueue:
             self.on_dead_letter(envelope.get("payload") or {}, item["error"])
 
     def dead_letters(self, limit: int = 100) -> list:
-        if self._redis:
-            rows = self._redis.xrevrange(self.DLQ, count=max(1, min(limit, 500)))
-            return [json.loads(fields["envelope"]) for _id, fields in rows]
         with self._lock:
             return list(reversed(self._memory_dlq[-limit:]))
 
     def replay_dead_letter(self, message_id: str) -> bool:
         for item in self.dead_letters(500):
             if item.get("message_id") == message_id:
-                payload = item.get("payload") or {}
-                self.submit(payload, message_id=message_id)
+                self.submit(item.get("payload") or {}, message_id=message_id)
                 return True
         return False
 
     def close(self) -> None:
         self._stop.set()
+        if self._consumer:
+            self._consumer.shutdown()
+        if self._producer:
+            self._producer.shutdown()
         self._executor.shutdown(wait=False)

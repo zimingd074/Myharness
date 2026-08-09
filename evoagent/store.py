@@ -281,6 +281,14 @@ class TaskStore:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS queue_dead_letters (
+                    message_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    failed_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS agent_memories (
                     id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
@@ -1162,6 +1170,33 @@ class TaskStore:
                 (tenant_id, max(1, min(limit, 500))),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_dead_letter(self, message_id: str, payload: Dict[str, Any], error: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO queue_dead_letters(message_id,payload_json,error,failed_at) "
+                "VALUES (?,?,?,?)",
+                (message_id, json.dumps(payload, ensure_ascii=False), error[:2000], utc_now()),
+            )
+
+    def list_dead_letters(self, limit: int = 100) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM queue_dead_letters ORDER BY failed_at DESC LIMIT ?",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
+
+    def get_dead_letter(self, message_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM queue_dead_letters WHERE message_id=?", (message_id,)
+            ).fetchone()
+        return ({**dict(row), "payload": json.loads(row["payload_json"])} if row else None)
+
+    def remove_dead_letter(self, message_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM queue_dead_letters WHERE message_id=?", (message_id,))
 
     def dashboard_stats(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
         with self._connect() as conn:

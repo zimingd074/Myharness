@@ -9,13 +9,13 @@
 - Web 管理台、任务 Dashboard 与 Prometheus 指标
 - 安全、可靠性、AI 和动态 Skill Agent 并行协作
 - 独立分支上的保守型自动修复提交
-- PostgreSQL、Redis 生产模式
+- PostgreSQL、RocketMQ 生产模式
 - 失败案例回流、提示词评测、版本激活与回滚
 - 自研 Agent Runtime、持久化 checkpoint、执行预算与任务断点续跑
 - 带 Tool Registry、参数 Schema 校验和结构化 Observation 的有界 Agent Loop
 - 覆盖任务、工具、反馈、记忆、观察与 Diff 的统一 Context Window 和逐轮压缩
 - Working/Episodic/Semantic 分层记忆、租户级检索、任务归档与过期清理
-- Redis Streams ACK、Worker 租约、指数退避重试和死信队列
+- RocketMQ ACK、Broker 消费租约、失败重投和持久化死信队列
 - Webhook delivery 幂等、重放时间窗与评论 upsert
 - 用户登录、RBAC、租户/仓库隔离和不可变管理审计
 - 动态 Skill manifest 校验、签名校验和隔离进程沙箱
@@ -270,7 +270,7 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-Compose 会启动 PostgreSQL、Redis 和 EvoAgent。未配置这两项时，项目自动退回 SQLite 与进程内线程队列，适合本地演示。
+Compose 会启动 PostgreSQL、RocketMQ NameServer/Broker 和 EvoAgent。未配置消息队列时，项目自动退回 SQLite 与进程内线程队列，适合本地演示。
 
 ## API
 
@@ -324,7 +324,7 @@ HTTP / GitHub Webhook
  ReviewHarness (EvoAgent Runtime / checkpoint / resume / budget / trace)
         │
         ├── DiffParser
-        ├── Redis Streams / ACK / lease / retry / DLQ
+        ├── RocketMQ / ACK / broker lease / retry / DLQ
         ├── ContextManager (unified token budget / iterative context compression)
         ├── MemoryManager (working / episodic / semantic / consolidation / expiry)
         └── MultiAgentCoordinator

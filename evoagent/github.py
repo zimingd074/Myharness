@@ -37,6 +37,10 @@ class GitHubClient:
         )
         return body.decode("utf-8", errors="replace")
 
+    def fetch_pull_request_diff(self, repository: str, number: int) -> str:
+        url = "https://api.github.com/repos/%s/pulls/%d" % (repository, number)
+        return self.fetch_diff(url)
+
     def post_comment(self, api_url: str, markdown: str) -> None:
         url = api_url.rstrip("/") + "/comments"
         request = urllib.request.Request(

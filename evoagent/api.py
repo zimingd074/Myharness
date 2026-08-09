@@ -192,7 +192,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not principal.can("manage"):
                 self._send_json(403, {"error": "permission denied"})
                 return
-            self._send_json(200, {"messages": self.service.queue.dead_letters(
+            self._send_json(200, {"messages": self.service.dead_letters(
                 int(query.get("limit", [100])[0])
             )})
             return
@@ -428,7 +428,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/v1/queue/dead-letters/replay":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
-                ok = self.service.queue.replay_dead_letter(
+                ok = self.service.replay_dead_letter(
                     str(payload.get("message_id", ""))
                 )
                 self._send_json(202 if ok else 404, {"replayed": ok})

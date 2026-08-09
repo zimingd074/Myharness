@@ -100,7 +100,7 @@ class ReviewService:
             max_metric_regression=settings.eval_max_metric_regression,
         )
         self.queue = TaskQueue(
-            self._process_queued, settings.async_workers, settings.redis_url,
+            self._process_queued, settings.async_workers, settings.rocketmq_nameserver,
             settings.queue_max_attempts, settings.queue_lease_seconds,
             self._on_dead_letter,
         )
@@ -351,7 +351,12 @@ class ReviewService:
                 if payload.get("installation_id") else self.github
             )
             client.ensure_repository_access(payload["repository"])
-            diff = client.fetch_diff(payload["diff_url"])
+            if payload.get("repository") and isinstance(payload.get("pull_request"), int):
+                diff = client.fetch_pull_request_diff(
+                    payload["repository"], payload["pull_request"]
+                )
+            else:
+                diff = client.fetch_diff(payload["diff_url"])
             self._validate_review(payload["repository"], diff)
             encoded = diff.encode("utf-8")
             self.store.save_task_payload(task_id, diff)
@@ -389,6 +394,8 @@ class ReviewService:
     def _on_dead_letter(self, payload: Dict[str, Any], error: str) -> None:
         task_id = payload.get("task_id", "")
         tenant_id = payload.get("tenant_id", "default")
+        if task_id:
+            self.store.record_dead_letter(task_id, payload, error)
         task = self.store.get(task_id, tenant_id) if task_id else None
         if task and task.get("state") not in {
             TaskState.SUCCESS.value, TaskState.FAILED.value, TaskState.CANCELLED.value,
@@ -408,6 +415,17 @@ class ReviewService:
             "Task %s entered the dead-letter queue: %s" % (task_id, error),
         )
         metrics.inc("dead_letters_total")
+
+    def dead_letters(self, limit: int = 100) -> list:
+        return self.store.list_dead_letters(limit)
+
+    def replay_dead_letter(self, message_id: str) -> bool:
+        item = self.store.get_dead_letter(message_id)
+        if not item:
+            return False
+        self.queue.submit(item["payload"], message_id=message_id)
+        self.store.remove_dead_letter(message_id)
+        return True
 
     def handle_github_pull_request(
         self, payload: Dict[str, Any], delivery_id: str,
