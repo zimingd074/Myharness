@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:16-alpine
+    ports:
+      - "5433:5432"
     environment:
       POSTGRES_DB: evoagent
       POSTGRES_USER: evoagent
@@ -60,7 +62,7 @@ services:
       EVOAGENT_AUTH_REQUIRED: "true"
       EVOAGENT_AUTH_SECRET: ${EVOAGENT_AUTH_SECRET:-local-only-change-this-secret-123456}
       EVOAGENT_BOOTSTRAP_ADMIN_USERNAME: ${EVOAGENT_BOOTSTRAP_ADMIN_USERNAME:-admin}
-      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD:-evoagent-local-admin}
+      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD:-123456}
     env_file:
       - path: .env
         required: false

@@ -7,7 +7,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from evoagent.auth import AuthManager
+from evoagent.auth import AuthManager, hash_password, verify_password
 from evoagent.harness import ReviewHarness
 from evoagent.reviewer import LocalRuleReviewer
 from evoagent.rollout import ReleaseManager
@@ -18,6 +18,15 @@ from evoagent.verifier import RepairVerifier
 
 
 DIFF = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
+
+
+class PasswordTests(unittest.TestCase):
+    def test_password_accepts_six_characters(self):
+        password_hash = hash_password("123456")
+
+        self.assertTrue(verify_password("123456", password_hash))
+        with self.assertRaisesRegex(ValueError, "at least 6"):
+            hash_password("12345")
 
 
 class ProductionFeatureTests(unittest.TestCase):

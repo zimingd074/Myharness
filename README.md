@@ -34,7 +34,7 @@ $bytes = New-Object byte[] 32
 $env:EVOAGENT_AUTH_REQUIRED = 'true'
 $env:EVOAGENT_AUTH_SECRET = [Convert]::ToBase64String($bytes)
 $env:EVOAGENT_BOOTSTRAP_ADMIN_USERNAME = 'admin'
-$env:EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD = '<替换为至少 10 个字符的密码>'
+$env:EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD = '<替换为至少 6 个字符的密码>'
 
 python -m evoagent
 ```
