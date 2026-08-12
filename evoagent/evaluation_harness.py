@@ -574,3 +574,73 @@ def comparison_summary(
             "gates": gates,
         },
     }
+
+
+def memory_comparison(memory, cases: Iterable[dict]) -> Dict[str, Dict[str, float]]:
+    """Compare the former lexical Top-K policy with scoped memory recall.
+
+    Each deterministic case supplies assignment fields plus ``useful_memory_ids``;
+    it may additionally provide ``expected_lifecycle`` and
+    ``observed_lifecycle``.  This keeps Memory evaluation independent of a
+    model provider and makes stale/irrelevant injection measurable.
+    """
+    cases = list(cases)
+
+    def legacy(case: dict) -> List[dict]:
+        # Mirrors the pre-refactor MemoryManager ranking, including its old
+        # semantic zero-overlap admission behaviour.
+        query_tokens = set(re.findall(r"[A-Za-z0-9_./:-]{2,}", str(case.get("objective", "")).lower()))
+        values = memory.store.list_agent_memories(case.get("tenant_id", "default"), case["repository"], ("semantic", "episodic"), 200)
+        ranked = []
+        for index, item in enumerate(values):
+            tokens = set(item.get("keywords") or []) | set(re.findall(r"[A-Za-z0-9_./:-]{2,}", item.get("content", "").lower()))
+            overlap = len(query_tokens.intersection(tokens))
+            if query_tokens and overlap == 0 and item.get("scope") != "semantic":
+                continue
+            score = overlap / max(1, len(query_tokens)) * .55 + overlap / max(1, len(tokens)) * .15 + float(item.get("importance", .5)) * .25 + .05 / (index + 1)
+            value = dict(item)
+            value["recall_score"] = score
+            ranked.append(value)
+        return sorted(ranked, key=lambda item: -item["recall_score"])[:int(case.get("limit", memory.recall_limit))]
+
+    def scoped(case: dict) -> List[dict]:
+        return memory.recall_for_assignment(
+            case.get("tenant_id", "default"), case["repository"], case.get("task_id", ""),
+            case.get("agent", "reviewer"), case.get("shard_id", "full"), case.get("files", []),
+            case.get("symbols", []), case.get("risk_domains", []), case.get("objective", ""),
+            case.get("source_sha", ""), int(case.get("limit", memory.recall_limit)),
+        )
+
+    def score(recall) -> Dict[str, float]:
+        totals = {"recall_precision": 0.0, "memory_recall_hit_rate": 0.0, "irrelevant_memory_rate": 0.0,
+                  "stale_memory_injection_rate": 0.0, "cross_task_useful_memory_hit_rate": 0.0,
+                  "false_positive_reduction_after_human_feedback": 0.0,
+                  "repeat_finding_classification_accuracy": 0.0, "average_memory_tokens_injected_per_agent_shard": 0.0}
+        recalled = useful = stale = cross_task = feedback_hits = lifecycle_correct = lifecycle_total = 0
+        for case in cases:
+            items = recall(case)
+            useful_ids = set(case.get("useful_memory_ids", []))
+            ids = {item.get("id") for item in items}
+            recalled += len(items)
+            useful += len(ids.intersection(useful_ids))
+            stale += sum((item.get("metadata") or {}).get("status") == "needs_revalidation" for item in items)
+            cross_task += sum(item.get("id") in useful_ids and item.get("task_id") != case.get("task_id", "") for item in items)
+            feedback_hits += sum(item.get("id") in useful_ids and (item.get("metadata") or {}).get("source_type") == "human_feedback" for item in items)
+            totals["average_memory_tokens_injected_per_agent_shard"] += sum(len(str(item.get("content", ""))) / 4 for item in items)
+            if "expected_lifecycle" in case:
+                lifecycle_total += 1
+                lifecycle_correct += int(case.get("observed_lifecycle") == case["expected_lifecycle"])
+        count = max(1, len(cases))
+        totals["recall_precision"] = round(useful / recalled, 4) if recalled else 1.0
+        totals["memory_recall_hit_rate"] = round(sum(bool({item.get("id") for item in recall(case)}.intersection(set(case.get("useful_memory_ids", [])))) for case in cases) / count, 4)
+        totals["irrelevant_memory_rate"] = round(1 - totals["recall_precision"], 4)
+        totals["stale_memory_injection_rate"] = round(stale / recalled, 4) if recalled else 0.0
+        totals["cross_task_useful_memory_hit_rate"] = round(cross_task / count, 4)
+        totals["false_positive_reduction_after_human_feedback"] = round(feedback_hits / count, 4)
+        totals["repeat_finding_classification_accuracy"] = round(lifecycle_correct / lifecycle_total, 4) if lifecycle_total else 1.0
+        totals["average_memory_tokens_injected_per_agent_shard"] = round(totals["average_memory_tokens_injected_per_agent_shard"] / count, 2)
+        return totals
+
+    baseline, candidate = score(legacy), score(scoped)
+    return {"baseline": baseline, "new": candidate,
+            "deltas": {key: round(candidate[key] - baseline[key], 4) for key in baseline}}

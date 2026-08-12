@@ -442,8 +442,10 @@ def render_memories(memories: Iterable[Dict[str, Any]], max_chars: int = 5000) -
     lines = []
     used = 0
     for item in memories:
-        line = "[%s/%s] %s" % (
-            item.get("scope", "memory"), item.get("kind", "note"),
+        status = (item.get("metadata") or {}).get("status", "")
+        state = " status=%s" % status if status and status != "active" else ""
+        line = "[%s/%s%s] %s" % (
+            item.get("scope", "memory"), item.get("kind", "note"), state,
             str(item.get("content", "")).replace("\n", " ")[:1000],
         )
         if used + len(line) + 1 > max_chars:

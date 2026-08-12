@@ -471,6 +471,7 @@ class MultiAgentCoordinator(Reviewer):
     def review_with_context(
         self, task_id: str, diff: str, parsed: ParsedDiff,
         repository: str = "", tenant_id: str = "default", pull_request: int = None,
+        source_sha: str = "",
     ) -> List[Finding]:
         state: CollaborationState = {
             "task_id": task_id, "diff": diff, "parsed": parsed,
@@ -478,11 +479,20 @@ class MultiAgentCoordinator(Reviewer):
             "bus": CollaborationBus(task_id, self.store),
             "pr_map": build_pr_context_map(diff, parsed), "coverage_gaps": [],
             "evidence_ledger": EvidenceLedger(), "llm_failures": [],
+            # Direct diff submissions have no Git ref.  A deterministic diff
+            # digest is an explicit version surrogate, never a claim about a
+            # repository commit; integrations can pass the actual head SHA.
+            "pull_request": pull_request,
+            "source_sha": source_sha or ("diff:" + hashlib.sha256(diff.encode("utf-8")).hexdigest()),
         }
         if self.snapshot_factory:
             state["snapshot_provider"] = self.snapshot_factory(
                 repository, pull_request, state["pr_map"], task_id
             )
+            if not source_sha:
+                head = str(getattr(state["snapshot_provider"], "ref", ""))
+                if head:
+                    state["source_sha"] = head
         result = self.runtime.execute(
             state,
             [
@@ -521,6 +531,13 @@ class MultiAgentCoordinator(Reviewer):
         self._bus(state).send(sender, recipient, kind, content, correlation_id)
 
     def _plan_node(self, state: CollaborationState) -> Dict[str, Any]:
+        if self.memory_manager and state.get("repository"):
+            self.memory_manager.mark_stale_memories(
+                state.get("tenant_id", "default"), state["repository"],
+                state["parsed"].files,
+                [symbol for item in state["pr_map"].files for symbol in item.symbols],
+                state.get("source_sha", ""),
+            )
         plan = self.planner.plan(state["parsed"], self.agents)
         shards = self._review_shards(state)
         assignments = []
@@ -609,13 +626,11 @@ class MultiAgentCoordinator(Reviewer):
             return []
         file_map = {item.path: item for item in state["pr_map"].files}
         symbols = [symbol for path in assignment.files for symbol in file_map.get(path, PRContextMap([], 0, 0)).symbols]
-        modules = [path.rsplit("/", 1)[0] if "/" in path else path for path in assignment.files]
-        query = " ".join([
-            assignment.objective, " ".join(assignment.files),
-            " ".join(assignment.risk_domains), " ".join(symbols), " ".join(modules),
-        ])
-        memories = self.memory_manager.recall(
-            state.get("tenant_id", "default"), state.get("repository", ""), query
+        memories = self.memory_manager.recall_for_assignment(
+            state.get("tenant_id", "default"), state.get("repository", ""),
+            state.get("task_id", ""), assignment.agent, assignment.shard_id or "full",
+            assignment.files, symbols, assignment.risk_domains, assignment.objective,
+            state.get("source_sha", ""),
         )
         if memories:
             self._emit(
@@ -666,9 +681,12 @@ class MultiAgentCoordinator(Reviewer):
         def recall_memory(query: str, limit: int = 5):
             if not self.memory_manager or not state.get("repository"):
                 return []
-            return self.memory_manager.recall(
-                state.get("tenant_id", "default"), state["repository"], str(query),
-                limit=max(1, min(int(limit), 10)),
+            return self.memory_manager.recall_for_assignment(
+                state.get("tenant_id", "default"), state["repository"], state.get("task_id", ""),
+                assignment.agent, assignment.shard_id or "full", assignment.files,
+                [symbol for item in state["pr_map"].files if item.path in assignment.files for symbol in item.symbols],
+                assignment.risk_domains, "%s %s" % (assignment.objective, str(query)),
+                state.get("source_sha", ""), max(1, min(int(limit), 10)),
             )
 
         def read_file(path: str, start_line: int, end_line: int):
@@ -773,20 +791,30 @@ class MultiAgentCoordinator(Reviewer):
             bundle.metadata(), assignment.assignment_id,
         )
         tools = self._agent_tools(state, assignment)
+        working_state = {
+            "confirmed_evidence": [], "rejected_hypotheses": [], "open_questions": [],
+            "files_inspected": [], "pending_files": list(assignment.files), "candidate_findings": [],
+        }
+        if self.memory_manager and state.get("task_id") and state.get("repository"):
+            self.memory_manager.remember_working_state(
+                state.get("tenant_id", "default"), state["repository"], state["task_id"],
+                agent.name, assignment.shard_id or "full", working_state,
+            )
 
         def on_event(kind: str, detail: Dict[str, Any]) -> None:
             self._emit(
                 state, "agent-runtime", agent.name, kind, detail,
                 assignment.assignment_id,
             )
-            if self.memory_manager and state.get("task_id") and state.get("repository"):
-                self.memory_manager.remember(
-                    state.get("tenant_id", "default"), state["repository"],
-                    "working", kind, json.dumps(detail, ensure_ascii=False, sort_keys=True),
-                    metadata={"shard_id": assignment.shard_id, "files": assignment.files,
-                              "risk_domains": assignment.risk_domains},
-                    task_id=state["task_id"], agent=agent.name, importance=0.3,
-                )
+            # The event transcript and raw tool output stay in LoopContext and
+            # the task collaboration log.  Only compact path/evidence refs are
+            # retained in Working Memory at the checkpoint below.
+            if kind == "agent_loop_observation":
+                result = detail.get("result") if isinstance(detail.get("result"), dict) else {}
+                path = result.get("path") if isinstance(result, dict) else ""
+                if path:
+                    working_state["files_inspected"].append(str(path))
+                    working_state["pending_files"] = [item for item in working_state["pending_files"] if item != path]
 
         loop_state = {
             "diff": local_diff, "context": bundle.text,
@@ -841,6 +869,15 @@ class MultiAgentCoordinator(Reviewer):
         findings = list(result.output or [])
         if not all(isinstance(item, Finding) for item in findings):
             raise TypeError("agent loop final output must contain Finding objects")
+        working_state["candidate_findings"] = [finding_key(item) for item in findings]
+        working_state["confirmed_evidence"] = [
+            str(item.get("id", "")) for item in result.loop_context.get("pinned_evidence", []) if item.get("id")
+        ]
+        if self.memory_manager and state.get("task_id") and state.get("repository"):
+            self.memory_manager.remember_working_state(
+                state.get("tenant_id", "default"), state["repository"], state["task_id"],
+                agent.name, assignment.shard_id or "full", working_state,
+            )
         return findings, {
             "loop_steps": result.steps, "loop_stop_reason": result.stop_reason,
             "context": last_context["metadata"], "memories_recalled": len(memories),
@@ -1256,7 +1293,19 @@ class MultiAgentCoordinator(Reviewer):
                     state.get("tenant_id", "default"), state["repository"],
                     state.get("task_id", ""), finding.to_dict(),
                     key in approved_keys, decision.reasons,
+                    pr_number=state.get("pull_request"), source_sha=state.get("source_sha", ""),
+                    source_agents=[getattr(state.get("assignments_by_agent", {}).get(source), "agent", "")
+                                   for source in state.get("finding_sources", {}).get(key, [])
+                                   if getattr(state.get("assignments_by_agent", {}).get(source), "agent", "")],
+                    shard_ids=[getattr(state.get("assignments_by_agent", {}).get(source), "shard_id", "")
+                               for source in state.get("finding_sources", {}).get(key, [])
+                               if getattr(state.get("assignments_by_agent", {}).get(source), "shard_id", "")],
+                    cross_shard="cross-shard" in state.get("finding_sources", {}).get(key, []),
                 )
+            self.memory_manager.compute_finding_delta(
+                state.get("tenant_id", "default"), state["repository"], state.get("pull_request"),
+                state.get("source_sha", ""), [item.to_dict() for item in verified], state["parsed"].files,
+            )
             if state.get("task_id"):
                 outcomes = state.get("agent_outcomes", [])
                 memory_summary = {
@@ -1273,10 +1322,15 @@ class MultiAgentCoordinator(Reviewer):
                         for item in outcomes
                     ),
                     "shard_count": len(state.get("shards") or []),
+                    "reviewed_files": sorted({path for item in outcomes if item.get("status") in {"completed", "fallback"}
+                                             for path in item.get("assignment").files}),
+                    "coverage_ratio": round(len({path for item in outcomes if item.get("status") in {"completed", "fallback"}
+                                                for path in item.get("assignment").files}) / max(1, len(state["parsed"].files)), 4),
                     "coverage_gaps": list(state.get("coverage_gaps") or []),
                     "cross_shard_findings": len(state.get("cross_shard_findings") or []),
                     "repo_tool_calls": sum(int((item.get("execution") or {}).get("repo_tool_calls", 0)) for item in outcomes),
                     "context_compaction_count": sum(int((item.get("execution") or {}).get("context_compaction_count", 0)) for item in outcomes),
+                    "context_compactions": sum(int((item.get("execution") or {}).get("context_compaction_count", 0)) for item in outcomes),
                 }
                 archived = self.memory_manager.consolidate_task(
                     state.get("tenant_id", "default"), state["repository"],

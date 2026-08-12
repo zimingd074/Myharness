@@ -49,7 +49,7 @@ class ReviewService:
         )
         self.memory = MemoryManager(
             self.store, settings.memory_enabled, settings.memory_recall_limit,
-            settings.memory_working_ttl_seconds,
+            settings.memory_working_ttl_seconds, settings.memory_promotion_support_threshold,
         )
         self.observability = Observability(settings.otel_service_name, settings.otel_endpoint)
         self.registry = SkillRegistry(
@@ -638,9 +638,13 @@ class ReviewService:
         if category not in {"false_positive", "missed_issue", "bad_fix", "accepted"}:
             raise ValueError("unsupported feedback category")
         self.store.record_failure_case(task_id, category, {"finding": finding, "note": note[:2000]})
+        feedback_finding = dict(finding or {})
+        feedback_finding.setdefault("pr_number", task.get("pull_request"))
+        payload = self.store.get_task_payload(task_id) or ""
         self.memory.remember_feedback(
             task.get("tenant_id") or tenant_id or "default", task["repository"],
-            task_id, category, finding, note[:2000],
+            task_id, category, feedback_finding, note[:2000],
+            "diff:" + hashlib.sha256(payload.encode("utf-8")).hexdigest() if payload else "",
         )
         metrics.inc("feedback_total")
         return {"recorded": True, "category": category}

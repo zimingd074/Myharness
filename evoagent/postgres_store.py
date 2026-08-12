@@ -267,7 +267,9 @@ class PostgresTaskStore:
                 "content,keywords_json,metadata_json,importance,created_at,expires_at) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s) "
                 "ON CONFLICT(id) DO UPDATE SET "
-                "importance=GREATEST(agent_memories.importance,EXCLUDED.importance),"
+                "task_id=EXCLUDED.task_id,agent=EXCLUDED.agent,scope=EXCLUDED.scope,"
+                "kind=EXCLUDED.kind,content=EXCLUDED.content,keywords_json=EXCLUDED.keywords_json,"
+                "metadata_json=EXCLUDED.metadata_json,importance=EXCLUDED.importance,"
                 "expires_at=EXCLUDED.expires_at RETURNING *",
                 (
                     memory["id"], memory["tenant_id"], memory["repository"],

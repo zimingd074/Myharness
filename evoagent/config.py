@@ -107,6 +107,7 @@ class Settings:
     memory_enabled: bool = True
     memory_recall_limit: int = 6
     memory_working_ttl_seconds: int = 86400
+    memory_promotion_support_threshold: int = 2
     skills_dir: str = "skills"
     github_app_id: str = ""
     github_app_slug: str = ""
@@ -263,6 +264,8 @@ class Settings:
             raise ValueError("EVOAGENT_CONTEXT_SPECIALIST_ACTIVATION must be directed, hybrid or all")
         if not 0 < self.context_soft_compact_ratio < self.context_hard_compact_ratio < 1:
             raise ValueError("context compact ratios must satisfy 0 < soft < hard < 1")
+        if self.memory_promotion_support_threshold < 1:
+            raise ValueError("EVOAGENT_MEMORY_PROMOTION_SUPPORT_THRESHOLD must be at least 1")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -306,6 +309,9 @@ class Settings:
             memory_recall_limit=_int("EVOAGENT_MEMORY_RECALL_LIMIT", 6),
             memory_working_ttl_seconds=_int(
                 "EVOAGENT_MEMORY_WORKING_TTL_SECONDS", 86400
+            ),
+            memory_promotion_support_threshold=_int(
+                "EVOAGENT_MEMORY_PROMOTION_SUPPORT_THRESHOLD", 2
             ),
             skills_dir=os.getenv("EVOAGENT_SKILLS_DIR", "skills"),
             github_app_id=os.getenv("EVOAGENT_GITHUB_APP_ID", ""),

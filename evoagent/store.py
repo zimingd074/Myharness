@@ -452,7 +452,9 @@ class TaskStore:
                 "INSERT INTO agent_memories(id,tenant_id,repository,task_id,agent,scope,kind,"
                 "content,keywords_json,metadata_json,importance,created_at,expires_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-                "importance=MAX(agent_memories.importance,excluded.importance),"
+                "task_id=excluded.task_id,agent=excluded.agent,scope=excluded.scope,"
+                "kind=excluded.kind,content=excluded.content,keywords_json=excluded.keywords_json,"
+                "metadata_json=excluded.metadata_json,importance=excluded.importance,"
                 "expires_at=excluded.expires_at",
                 (
                     memory["id"], memory["tenant_id"], memory["repository"],
