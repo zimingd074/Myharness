@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -37,6 +38,7 @@ RULE_TO_CWE = {
     "REL-NONATOMIC-WRITE": "CWE-362",
     "SEC-OPEN-REDIRECT": "CWE-601",
     "SEC-LOG-FORGING": "CWE-117",
+    "BUSINESS-NEGATIVE-BALANCE": "CWE-840",
 }
 
 
@@ -262,13 +264,21 @@ class EndToEndEvaluationHarness:
         self.line_tolerance = line_tolerance
         self.repairer = repairer
 
-    def run(self, reviewer: Reviewer, cases: List[dict], name: str = "") -> Dict[str, Any]:
+    def run(
+        self, reviewer: Reviewer, cases: List[dict], name: str = "", max_workers: int = 1,
+    ) -> Dict[str, Any]:
         started = time.monotonic()
         totals = self._empty_totals()
-        case_results = []
-        for case in cases:
-            result = self._run_case(reviewer, case)
-            case_results.append(result)
+        if max_workers < 1:
+            raise ValueError("max_workers must be positive")
+        if max_workers == 1:
+            case_results = [self._run_case(reviewer, case) for case in cases]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                case_results = list(executor.map(
+                    lambda case: self._run_case(reviewer, case), cases
+                ))
+        for result in case_results:
             self._accumulate(totals, result)
         metrics = self._metrics(totals)
         by_split = {}
@@ -285,6 +295,8 @@ class EndToEndEvaluationHarness:
             "schema_version": 1,
             "name": name or reviewer.name,
             "reviewer": reviewer.name,
+            "execution_path": getattr(reviewer, "execution_path", "direct-reviewer"),
+            "parallelism": max_workers,
             "dataset": {
                 "cases": len(cases),
                 "repositories": len({case["repository"] for case in cases}),
@@ -324,10 +336,18 @@ class EndToEndEvaluationHarness:
             "matches": [],
             "repair": [],
             "error": None,
+            "context": {},
+            "changed_files": 0,
         }
         try:
             parsed = parse_unified_diff(case["diff"])
-            findings = reviewer.review(case["diff"], parsed)
+            result["changed_files"] = len(parsed.files)
+            review_case = getattr(reviewer, "review_case", None)
+            findings = (
+                review_case(case, parsed)
+                if callable(review_case)
+                else reviewer.review(case["diff"], parsed)
+            )
             matches = one_to_one_match(expected, findings, self.line_tolerance)
             result["predicted"] = len(findings)
             result["tp"] = len(matches)
@@ -335,6 +355,9 @@ class EndToEndEvaluationHarness:
             result["fn"] = len(expected) - len(matches)
             result["clean_hit"] = not expected and not findings
             result["execution_success"] = True
+            summary_reader = getattr(reviewer, "last_collaboration_summary", None)
+            if callable(summary_reader):
+                result["context"] = summary_reader()
             matched_expected = set()
             for match in matches:
                 truth = expected[match.expected_index]
@@ -382,6 +405,15 @@ class EndToEndEvaluationHarness:
             "fn": 0, "severity_hits": 0, "high_total": 0, "high_hits": 0,
             "clean_hits": 0, "execution_successes": 0, "repair_attempted": 0,
             "repair_passed": 0, "e2e_successes": 0,
+            "input_tokens": 0, "max_input_tokens": 0, "tool_calls": 0, "repo_tool_calls": 0,
+            "llm_calls": 0,
+            "shards": 0, "cross_shard_findings": 0, "coverage_gaps": 0,
+            "llm_failures": 0,
+            "retrieved_context_tokens": 0, "context_compaction_count": 0,
+            "compressed_rounds": 0, "pinned_evidence_count": 0,
+            "changed_files": 0, "reviewed_files": 0,
+            "changed_hunks": 0, "visible_hunks": 0,
+            "changed_added_lines": 0, "visible_added_lines": 0,
         }
 
     @staticmethod
@@ -397,6 +429,25 @@ class EndToEndEvaluationHarness:
         totals["clean_hits"] += int(result["clean_hit"])
         totals["execution_successes"] += int(result["execution_success"])
         totals["e2e_successes"] += int(result["e2e_success"])
+        context = result.get("context") or {}
+        totals["input_tokens"] += int(context.get("total_input_tokens", 0))
+        totals["max_input_tokens"] = max(totals["max_input_tokens"], int(context.get("max_input_tokens", 0)))
+        totals["tool_calls"] += int(context.get("tool_calls", 0))
+        totals["repo_tool_calls"] += int(context.get("repo_tool_calls", 0))
+        totals["llm_calls"] += int(context.get("llm_calls", 0))
+        totals["shards"] += int(context.get("shard_count", 0))
+        totals["cross_shard_findings"] += int(context.get("cross_shard_findings", 0))
+        totals["coverage_gaps"] += len(context.get("coverage_gaps", []))
+        totals["llm_failures"] += len(context.get("llm_failures", []))
+        for field in ("retrieved_context_tokens", "context_compaction_count",
+                      "compressed_rounds", "pinned_evidence_count"):
+            totals[field] += int(context.get(field, 0))
+        totals["changed_files"] += int(result.get("changed_files", 0))
+        totals["reviewed_files"] += len(context.get("reviewed_files", []))
+        totals["changed_hunks"] += int(context.get("changed_hunks", 0))
+        totals["visible_hunks"] += int(context.get("visible_hunks", 0))
+        totals["changed_added_lines"] += int(context.get("changed_added_lines", 0))
+        totals["visible_added_lines"] += int(context.get("visible_added_lines", 0))
 
     @staticmethod
     def _metrics(totals: Dict[str, int]) -> Dict[str, Any]:
@@ -424,6 +475,17 @@ class EndToEndEvaluationHarness:
             ),
             "e2e_security_fix_rate": ratio(
                 totals["e2e_successes"], totals["risk_cases"], 0.0
+            ),
+            "average_input_tokens": ratio(totals["input_tokens"], totals["cases"], 0.0),
+            "average_shards": ratio(totals["shards"], totals["cases"], 0.0),
+            "changed_file_coverage": ratio(totals["reviewed_files"], totals["changed_files"], 0.0),
+            # Compression may retain only a subset of a hunk.  Added-line
+            # visibility is therefore the truthful coverage denominator; keep
+            # the old hunk counters for backwards-compatible observability.
+            "changed_hunk_coverage": ratio(
+                totals["visible_added_lines"], totals["changed_added_lines"], 0.0
+            ) if totals["changed_added_lines"] else ratio(
+                totals["visible_hunks"], totals["changed_hunks"], 0.0
             ),
         }
 

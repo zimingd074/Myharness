@@ -14,6 +14,7 @@ import re
 from typing import Any, Dict, Iterable, List, Set
 
 from .diff_parser import parse_unified_diff
+from .ab_report import build_ab_summary, markdown_sections, report_paths
 from .evaluation_benchmark import ContextRuleReviewer
 from .evaluation_harness import RULE_TO_CWE, dataset_fingerprint, load_jsonl, one_to_one_match
 from .evolution import DEFAULT_PROMPT, EvolutionEngine, RegressionEvaluator
@@ -255,6 +256,11 @@ def run_prompt_evolution_proof(dataset_path: str, database_path: str) -> Dict[st
     candidate_all = evaluator.run(candidate_prompt, all_cases)
     provenance_passed = source_kinds == ["public-github-pr"]
     quantitative_passed = result.get("decision") == "activated"
+    ab_summary = build_ab_summary(
+        "prompt-evolution",
+        learned_rule_ids=result.get("learned_rule_ids", []),
+        removed_rule_ids=result.get("removed_rule_ids", []),
+    )
     return {
         "schema_version": 1,
         "generated_at": utc_now(),
@@ -327,6 +333,7 @@ def run_prompt_evolution_proof(dataset_path: str, database_path: str) -> Dict[st
             "production_data_provenance_passed": provenance_passed,
             "production_activation_allowed": quantitative_passed and provenance_passed,
         },
+        "ab_summary": ab_summary,
     }
 
 
@@ -410,13 +417,15 @@ def render_markdown(report: Dict[str, Any]) -> str:
         "- Holdout 数据指纹：`%s`" % report["dataset"]["holdout_sha256"],
         "",
     ])
+    lines.append("")
+    lines.extend(markdown_sections(report["ab_summary"]))
     return "\n".join(lines)
 
 
 def write_report(report: Dict[str, Any], output_dir: str) -> Dict[str, str]:
-    os.makedirs(output_dir, exist_ok=True)
-    json_path = os.path.join(output_dir, "prompt-evolution-proof.json")
-    markdown_path = os.path.join(output_dir, "prompt-evolution-proof.md")
+    paths = report_paths(output_dir, "prompt-evolution-ab-comparison")
+    json_path = paths["json"]
+    markdown_path = paths["markdown"]
     with open(json_path, "w", encoding="utf-8", newline="\n") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")

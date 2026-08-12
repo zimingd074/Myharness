@@ -7,6 +7,7 @@ from .agents import MultiAgentCoordinator
 from .auth import AuthManager
 from .config import Settings
 from .context_manager import ContextManager
+from .context.retrieval import GitHubSnapshotProvider
 from .evolution import EvolutionEngine
 from .fixer import SafeFixer
 from .github import GitHubAppAuthenticator, GitHubClient
@@ -18,7 +19,7 @@ from .observability import AlertManager, Observability
 from .postgres_store import create_store
 from .report import to_markdown
 from .reviewer import (
-    LocalRuleReviewer, OpenAICompatibleReviewer, ReliabilityRuleReviewer,
+    ContextRuleReviewer, LocalRuleReviewer, OpenAICompatibleReviewer, ReliabilityRuleReviewer,
     SecurityRuleReviewer,
 )
 from .diff_parser import parse_unified_diff
@@ -34,10 +35,17 @@ class ReviewService:
     def __init__(self, settings: Settings):
         self.settings = settings
         settings.validate_evolution()
-        self.llm_config = settings.resolved_llm()
+        self.review_timeout_seconds = max(
+            settings.timeout_seconds, settings.agent_runtime_timeout_seconds,
+        )
+        self.llm_config = {} if settings.llm_mode == "disabled" else settings.resolved_llm()
+        if settings.llm_mode == "required" and not self.llm_config:
+            raise ValueError("EVOAGENT_LLM_MODE=required needs a configured LLM provider")
         self.store = create_store(settings.database_url, settings.db_path)
         self.context_manager = ContextManager(
-            settings.context_max_tokens, settings.context_reserved_tokens
+            settings.context_max_tokens, settings.context_reserved_tokens,
+            soft_compact_ratio=settings.context_soft_compact_ratio,
+            hard_compact_ratio=settings.context_hard_compact_ratio,
         )
         self.memory = MemoryManager(
             self.store, settings.memory_enabled, settings.memory_recall_limit,
@@ -57,6 +65,11 @@ class ReviewService:
             "reliability-review", ReliabilityRuleReviewer(),
             ReliabilityRuleReviewer.RULESET_REVISION, "Reliability and observability review",
         )
+        self.registry.register(
+            "context-security-reliability-review", ContextRuleReviewer(),
+            ContextRuleReviewer.RULESET_REVISION,
+            "Context-sensitive security and reliability review",
+        )
         if self.llm_config:
             active = self.store.get_active_skill_version("llm-review")
             self.registry.register(
@@ -68,7 +81,7 @@ class ReviewService:
         coordinator = self._build_coordinator(self.registry.reviewers())
         self.reviewer = coordinator
         self.harness = ReviewHarness(
-            self.store, self.reviewer, settings.max_steps, settings.timeout_seconds,
+            self.store, self.reviewer, settings.max_steps, self.review_timeout_seconds,
             observability=self.observability,
         )
         self.github = GitHubClient(settings.github_token)
@@ -114,13 +127,26 @@ class ReviewService:
             str(self.llm_config["base_url"]),
             str(self.llm_config["api_key"]),
             str(self.llm_config["model"]),
-            self.settings.timeout_seconds,
+            self.settings.llm_request_timeout_seconds,
             system_prompt=prompt,
             provider=str(self.llm_config["provider"]),
             extra_headers=dict(self.llm_config.get("headers") or {}),
         )
 
     def _build_coordinator(self, reviewers: list) -> MultiAgentCoordinator:
+        def snapshot_factory(repository, pull_request, pr_map, _task_id):
+            # Direct API-submitted diffs have no trustworthy PR ref. In that case
+            # tools remain explicitly unavailable rather than reading the host.
+            if not repository or pull_request is None or not self.settings.github_token:
+                return None
+            try:
+                head = self.github.get_pull_request_head(repository, int(pull_request))
+                return GitHubSnapshotProvider(
+                    self.github, repository, head, [item.path for item in pr_map.files],
+                    allow_related=True,
+                ) if head else None
+            except Exception:
+                return None
         return MultiAgentCoordinator(
             reviewers, max_workers=self.settings.agent_max_workers, store=self.store,
             agent_retries=self.settings.agent_retries,
@@ -128,6 +154,16 @@ class ReviewService:
             context_manager=self.context_manager, memory_manager=self.memory,
             agent_loop_max_steps=self.settings.agent_loop_max_steps,
             agent_loop_timeout_seconds=self.settings.agent_loop_timeout_seconds,
+            agent_runtime_max_steps=self.settings.agent_runtime_max_steps,
+            agent_runtime_timeout_seconds=self.settings.agent_runtime_timeout_seconds,
+            context_active_rounds=self.settings.context_active_rounds,
+            context_soft_compact_ratio=self.settings.context_soft_compact_ratio,
+            context_hard_compact_ratio=self.settings.context_hard_compact_ratio,
+            context_architecture=self.settings.context_architecture,
+            specialist_activation=self.settings.context_specialist_activation,
+            shard_file_threshold=self.settings.context_shard_file_threshold,
+            shard_changed_line_threshold=self.settings.context_shard_changed_line_threshold,
+            snapshot_factory=snapshot_factory,
         )
 
     def _candidate_reviewer(self, tenant_id: str):
@@ -164,7 +200,7 @@ class ReviewService:
                 ] + evolved + [candidate])
                 harness = ReviewHarness(
                     self.store, canary_reviewer, self.settings.max_steps,
-                    self.settings.timeout_seconds, observability=self.observability,
+                    self.review_timeout_seconds, observability=self.observability,
                     runtime_fingerprint=runtime_fingerprint, run_token=run_token,
                     claim_token=claim_token,
                 )
@@ -175,13 +211,13 @@ class ReviewService:
             )
             harness = ReviewHarness(
                 self.store, tenant_reviewer, self.settings.max_steps,
-                self.settings.timeout_seconds, observability=self.observability,
+                self.review_timeout_seconds, observability=self.observability,
                 runtime_fingerprint=runtime_fingerprint, run_token=run_token,
                 claim_token=claim_token,
             )
             return harness.run(task_id, repository, pull_request, diff, tenant_id)
         harness = ReviewHarness(
-            self.store, self.reviewer, self.settings.max_steps, self.settings.timeout_seconds,
+            self.store, self.reviewer, self.settings.max_steps, self.review_timeout_seconds,
             observability=self.observability, runtime_fingerprint=runtime_fingerprint,
             run_token=run_token, claim_token=claim_token,
         )
@@ -303,7 +339,7 @@ class ReviewService:
         skills = self.registry.list()
         self.reviewer = self._build_coordinator(self.registry.reviewers())
         self.harness = ReviewHarness(
-            self.store, self.reviewer, self.settings.max_steps, self.settings.timeout_seconds,
+            self.store, self.reviewer, self.settings.max_steps, self.review_timeout_seconds,
             observability=self.observability,
         )
         return skills

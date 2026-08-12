@@ -106,6 +106,45 @@ class LocalRuleReviewer(Reviewer):
         return findings
 
 
+class ContextRuleReviewer(Reviewer):
+    """Context-sensitive security and reliability rules used by the production coordinator."""
+
+    name = "context-security-reliability-agent"
+    RULESET_REVISION = "1"
+    domains = ("security", "reliability", "correctness")
+    RULES = [
+        ("SEC-PATH-TRAVERSAL", Severity.HIGH, re.compile(r"open\(base\s*/\s*user_path\)")),
+        ("SEC-YAML-LOAD", Severity.HIGH, re.compile(r"\byaml\.load\s*\(")),
+        ("SEC-WEAK-HASH", Severity.MEDIUM, re.compile(r"\bhashlib\.md5\s*\(")),
+        ("SEC-INSECURE-TEMPFILE", Severity.MEDIUM, re.compile(r"\btempfile\.mktemp\s*\(")),
+        ("SEC-WEAK-RANDOM", Severity.MEDIUM, re.compile(r"\brandom\.random\s*\(")),
+        ("REL-UNBOUNDED-RETRY", Severity.MEDIUM, re.compile(r"^\s*while\s+True\s*:")),
+        ("SEC-ASSERT-AUTH", Severity.MEDIUM, re.compile(r"^\s*assert\s+user\.is_admin")),
+        ("SEC-INSECURE-COOKIE", Severity.MEDIUM, re.compile(r"set_cookie\(.+secure\s*=\s*False")),
+    ]
+
+    def review(self, diff: str, parsed: ParsedDiff) -> List[Finding]:
+        findings = []
+        for line in parsed.added_lines:
+            for rule_id, severity, pattern in self.RULES:
+                if pattern.search(line.content):
+                    findings.append(Finding(
+                        rule_id=rule_id,
+                        severity=severity,
+                        title="Context-sensitive security or reliability finding",
+                        explanation=(
+                            "The changed line matches a context-sensitive security or reliability risk."
+                        ),
+                        path=line.path,
+                        line=line.line,
+                        evidence=line.content.strip()[:240],
+                        fix="Replace the unsafe operation with a constrained, validated alternative.",
+                        test="Add a focused reproduction and run compilation plus regression tests.",
+                        confidence=0.86,
+                    ))
+        return findings
+
+
 class DomainRuleReviewer(Reviewer):
     """Independent deterministic specialist backed by an explicit rule policy."""
 
@@ -211,9 +250,10 @@ class OpenAICompatibleReviewer(Reviewer):
             '{"action":"final","findings":[{"rule_id":"...",'
             '"severity":"critical|high|medium|low","title":"...",'
             '"explanation":"...","path":"...","line":1,"evidence":"...",'
-            '"fix":"...","test":"...","confidence":0.0}]}. '
+            '"fix":"...","test":"...","confidence":0.0,"evidence_refs":["R1"]}]}. '
             "Use the TOOL parameter schemas in the managed context. Use a tool only when evidence "
-            "is missing. Report only defects introduced by added lines."
+            "is missing. When no project rule ID applies, use the relevant standard CWE identifier as rule_id. "
+            "Report only defects introduced by added lines."
         ) % tool_names
         system = (
             (self.system_prompt or "You are a senior secure code reviewer operating in a bounded agent loop.")
@@ -330,6 +370,7 @@ class OpenAICompatibleReviewer(Reviewer):
                     fix=str(raw.get("fix", ""))[:2000],
                     test=str(raw.get("test", ""))[:2000],
                     confidence=max(0.0, min(1.0, float(raw.get("confidence", 0.7)))),
+                    evidence_refs=[str(item) for item in list(raw.get("evidence_refs") or [])[:8]],
                 )
             )
         return findings

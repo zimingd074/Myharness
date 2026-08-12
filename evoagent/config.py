@@ -83,10 +83,27 @@ class Settings:
     agent_max_workers: int = 4
     agent_retries: int = 1
     collaboration_rounds: int = 2
-    agent_loop_max_steps: int = 4
-    agent_loop_timeout_seconds: int = 45
+    # A large PR has a bounded loop per responsible Specialist × Shard.  These
+    # defaults leave room for retrieval and verification without allowing an
+    # individual request to consume the whole review deadline.
+    agent_loop_max_steps: int = 6
+    agent_loop_timeout_seconds: int = 120
+    agent_runtime_max_steps: int = 8
+    agent_runtime_timeout_seconds: int = 300
+    llm_request_timeout_seconds: int = 60
+    llm_mode: str = "controlled"
     context_max_tokens: int = 12000
     context_reserved_tokens: int = 2500
+    context_architecture: str = "coverage-first"
+    # The latest real three-arm evaluation did not meet hybrid's no-gap
+    # acceptance gate, so fail closed to full specialist activation. Operators
+    # may explicitly set hybrid after validating their provider's stability.
+    context_specialist_activation: str = "all"
+    context_shard_file_threshold: int = 12
+    context_shard_changed_line_threshold: int = 1200
+    context_active_rounds: int = 3
+    context_soft_compact_ratio: float = 0.60
+    context_hard_compact_ratio: float = 0.80
     memory_enabled: bool = True
     memory_recall_limit: int = 6
     memory_working_ttl_seconds: int = 86400
@@ -226,12 +243,26 @@ class Settings:
             raise ValueError("EVOAGENT_COLLABORATION_ROUNDS must be at least 1")
         if self.agent_loop_max_steps < 1:
             raise ValueError("EVOAGENT_AGENT_LOOP_MAX_STEPS must be at least 1")
+        if self.agent_runtime_max_steps < 7:
+            raise ValueError("EVOAGENT_AGENT_RUNTIME_MAX_STEPS must allow the review protocol")
+        if self.agent_runtime_timeout_seconds < self.agent_loop_timeout_seconds:
+            raise ValueError("EVOAGENT_AGENT_RUNTIME_TIMEOUT_SECONDS cannot be below loop timeout")
+        if self.llm_request_timeout_seconds < 1:
+            raise ValueError("EVOAGENT_LLM_REQUEST_TIMEOUT_SECONDS must be at least 1")
+        if self.llm_mode not in {"controlled", "required", "disabled"}:
+            raise ValueError("EVOAGENT_LLM_MODE must be controlled, required or disabled")
         if self.context_max_tokens < 512:
             raise ValueError("EVOAGENT_CONTEXT_MAX_TOKENS must be at least 512")
         if not 0 <= self.context_reserved_tokens < self.context_max_tokens:
             raise ValueError(
                 "EVOAGENT_CONTEXT_RESERVED_TOKENS must be smaller than the context budget"
             )
+        if self.context_architecture not in {"legacy", "coverage-first"}:
+            raise ValueError("EVOAGENT_CONTEXT_ARCHITECTURE must be legacy or coverage-first")
+        if self.context_specialist_activation not in {"directed", "hybrid", "all"}:
+            raise ValueError("EVOAGENT_CONTEXT_SPECIALIST_ACTIVATION must be directed, hybrid or all")
+        if not 0 < self.context_soft_compact_ratio < self.context_hard_compact_ratio < 1:
+            raise ValueError("context compact ratios must satisfy 0 < soft < hard < 1")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -254,12 +285,23 @@ class Settings:
             agent_max_workers=_int("EVOAGENT_AGENT_MAX_WORKERS", 4),
             agent_retries=_non_negative_int("EVOAGENT_AGENT_RETRIES", 1),
             collaboration_rounds=_int("EVOAGENT_COLLABORATION_ROUNDS", 2),
-            agent_loop_max_steps=_int("EVOAGENT_AGENT_LOOP_MAX_STEPS", 4),
-            agent_loop_timeout_seconds=_int("EVOAGENT_AGENT_LOOP_TIMEOUT_SECONDS", 45),
+            agent_loop_max_steps=_int("EVOAGENT_AGENT_LOOP_MAX_STEPS", 6),
+            agent_loop_timeout_seconds=_int("EVOAGENT_AGENT_LOOP_TIMEOUT_SECONDS", 120),
+            agent_runtime_max_steps=_int("EVOAGENT_AGENT_RUNTIME_MAX_STEPS", 8),
+            agent_runtime_timeout_seconds=_int("EVOAGENT_AGENT_RUNTIME_TIMEOUT_SECONDS", 300),
+            llm_request_timeout_seconds=_int("EVOAGENT_LLM_REQUEST_TIMEOUT_SECONDS", 60),
+            llm_mode=os.getenv("EVOAGENT_LLM_MODE", "controlled").strip().lower(),
             context_max_tokens=_int("EVOAGENT_CONTEXT_MAX_TOKENS", 12000),
             context_reserved_tokens=_non_negative_int(
                 "EVOAGENT_CONTEXT_RESERVED_TOKENS", 2500
             ),
+            context_architecture=os.getenv("EVOAGENT_CONTEXT_ARCHITECTURE", "coverage-first"),
+            context_specialist_activation=os.getenv("EVOAGENT_CONTEXT_SPECIALIST_ACTIVATION", "all"),
+            context_shard_file_threshold=_int("EVOAGENT_CONTEXT_SHARD_FILE_THRESHOLD", 12),
+            context_shard_changed_line_threshold=_int("EVOAGENT_CONTEXT_SHARD_CHANGED_LINE_THRESHOLD", 1200),
+            context_active_rounds=_int("EVOAGENT_CONTEXT_ACTIVE_ROUNDS", 3),
+            context_soft_compact_ratio=float(os.getenv("EVOAGENT_CONTEXT_SOFT_COMPACT_RATIO", "0.60")),
+            context_hard_compact_ratio=float(os.getenv("EVOAGENT_CONTEXT_HARD_COMPACT_RATIO", "0.80")),
             memory_enabled=_bool("EVOAGENT_MEMORY_ENABLED", True),
             memory_recall_limit=_int("EVOAGENT_MEMORY_RECALL_LIMIT", 6),
             memory_working_ttl_seconds=_int(

@@ -17,6 +17,10 @@ import json
 import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from .context.loop_context import LoopContext
+from .context.reducers import reduce_tool_result
+from .context.budget import ContextBudget
+
 
 class RuntimeBudgetExceeded(RuntimeError):
     """The configured step or wall-clock budget was exhausted."""
@@ -40,6 +44,7 @@ class AgentTool:
     description: str
     parameters: Dict[str, Any]
     handler: Callable[..., Any]
+    reducer: Optional[Callable[[Any, int], str]] = None
 
     def catalog_entry(self) -> Dict[str, Any]:
         return {
@@ -256,6 +261,7 @@ class AgentLoopResult:
     steps: int
     observations: List[Dict[str, Any]]
     stop_reason: str
+    loop_context: Dict[str, Any] = field(default_factory=dict)
 
 
 class AgentLoop:
@@ -263,7 +269,9 @@ class AgentLoop:
 
     def __init__(
         self, max_steps: int = 4, timeout_seconds: int = 45,
-        max_observation_chars: int = 4000,
+        max_observation_chars: int = 4000, active_rounds: int = 3,
+        soft_compact_ratio: float = .60, hard_compact_ratio: float = .80,
+        context_budget: Optional[ContextBudget] = None,
     ):
         if max_steps < 1:
             raise ValueError("agent loop max_steps must be at least 1")
@@ -272,6 +280,10 @@ class AgentLoop:
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
         self.max_observation_chars = max(256, max_observation_chars)
+        self.active_rounds = max(1, active_rounds)
+        self.soft_compact_ratio = soft_compact_ratio
+        self.hard_compact_ratio = hard_compact_ratio
+        self.context_budget = context_budget
 
     def run(
         self, stepper: Callable[[Dict[str, Any]], Dict[str, Any]],
@@ -280,6 +292,7 @@ class AgentLoop:
     ) -> AgentLoopResult:
         state = dict(initial_state)
         observations = list(state.get("observations") or [])
+        loop_context = LoopContext(self.active_rounds, self.soft_compact_ratio, self.hard_compact_ratio)
         started = time.monotonic()
 
         def emit(kind: str, **detail) -> None:
@@ -292,15 +305,29 @@ class AgentLoop:
                 raise RuntimeBudgetExceeded("agent loop time budget exceeded")
             state["loop_step"] = step
             state["observations"] = list(observations)
+            state["loop_context"] = loop_context.render()
             action = stepper(state)
             if not isinstance(action, dict):
                 raise AgentLoopProtocolError("agent loop action must be an object")
             kind = str(action.get("action", "")).strip().lower()
             emit("agent_loop_action", step=step, action=kind)
             if kind == "final":
+                output = action.get("findings", action.get("output"))
+                for finding in list(output or []):
+                    finding_id = str(getattr(finding, "rule_id", "finding"))
+                    explicit_refs = list(getattr(finding, "evidence_refs", []) or [])
+                    if explicit_refs:
+                        loop_context.pin(explicit_refs, finding_id)
+                    else:
+                        # A model that did not return an ID may only fall back
+                        # to an exact changed-line locator, never "latest".
+                        loop_context.pin_finding(
+                            finding_id, str(getattr(finding, "path", "")),
+                            int(getattr(finding, "line", 0) or 0),
+                        )
                 return AgentLoopResult(
-                    action.get("findings", action.get("output")), step,
-                    observations, "final",
+                    output, step,
+                    observations, "final", loop_context.render(),
                 )
             if kind != "tool":
                 raise AgentLoopProtocolError("unsupported agent loop action: %s" % kind)
@@ -311,18 +338,21 @@ class AgentLoop:
             try:
                 if isinstance(tools, ToolRegistry):
                     value = tools.invoke(tool_name, arguments)
+                    tool_spec = tools._tools.get(tool_name)
                 else:
                     tool = tools.get(tool_name)
                     if tool is None:
                         raise AgentLoopProtocolError("unknown agent tool: %s" % tool_name)
                     value = tool(**arguments)
+                    tool_spec = None
                 rendered = (
-                    json.dumps(value, ensure_ascii=False, sort_keys=True)
-                    if isinstance(value, (dict, list, tuple)) else str(value)
+                    tool_spec.reducer(value, self.max_observation_chars)
+                    if tool_spec and tool_spec.reducer else
+                    reduce_tool_result(tool_name, value, self.max_observation_chars)
                 )
                 observation = {
                     "step": step, "tool": tool_name, "ok": True,
-                    "result": rendered[:self.max_observation_chars],
+                    "result": rendered,
                 }
             except Exception as exc:
                 observation = {
@@ -330,6 +360,34 @@ class AgentLoop:
                     "error": str(exc)[:1000],
                 }
             observations.append(observation)
+            observation.update({
+                "shard_id": str(state.get("shard_identity", {}).get("id", "")),
+                "agent": str(state.get("assignment", {}).get("agent", "")),
+            })
+            loop_context.add_round(step, action, observation)
+            evidence_refs = action.get("evidence_refs") or []
+            if isinstance(evidence_refs, list):
+                loop_context.pin(evidence_refs)
+            context_tokens = int(action.get("_context_tokens", 0) or 0)
+            context_max_tokens = max(1, int(action.get("_context_max_tokens", 0) or 1))
+            # ContextBudget is the single threshold authority.  A supplied
+            # manager budget preserves its configured 60%/80% policy; a loop
+            # used stand-alone gets an equivalent local policy.
+            budget = self.context_budget or ContextBudget(
+                max_tokens=context_max_tokens,
+                soft_compact_ratio=self.soft_compact_ratio,
+                hard_compact_ratio=self.hard_compact_ratio,
+            )
+            if budget.max_tokens != context_max_tokens:
+                budget = ContextBudget(
+                    max_tokens=context_max_tokens,
+                    soft_compact_ratio=budget.soft_compact_ratio,
+                    hard_compact_ratio=budget.hard_compact_ratio,
+                )
+            over_soft = budget.should_compact(context_tokens)
+            over_hard = budget.should_compact(context_tokens, hard=True)
+            if len(observations) > loop_context.active_rounds or over_soft:
+                loop_context.compact(force=over_hard)
             emit("agent_loop_observation", **observation)
         emit("agent_loop_budget_exhausted", step=self.max_steps, budget="steps")
         raise RuntimeBudgetExceeded("agent loop step budget exceeded")

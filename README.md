@@ -135,7 +135,7 @@ EVOAGENT_DEEPSEEK_API_KEY=你的真实APIKey
 python scripts/run_prompt_evolution_proof.py
 ```
 
-输出位于 `output/prompt-evolution-proof/`。该实验用于证明“反馈驱动的提示词版本确实改变 Agent 行为并通过隐藏集门禁”，数据来源仍是 `synthetic-controlled`，因此生产来源门禁保持失败；它不应被表述为外部 LLM 权重提升或真实公开 PR 上的生产效果。
+评测产物统一输出到 `tests/evaluation_reports/` 下以“时间戳_修改摘要”命名的独立子目录；JSON、Markdown、评测集副本与任务数据库都会归档在同一次运行目录中。端到端 A/B 评测使用 `python scripts/run_e2e_evaluation.py --reuse-dataset`，并通过 `enqueue_review → queue → ReviewHarness → 持久化 ReviewReport` 执行；添加 `--with-llm` 后，候选服务还会加载已配置的 OpenAI 兼容 LLM specialist。LLM 评测默认将模型请求、Agent Loop 和任务超时提高到 180 秒，可通过 `--llm-timeout-seconds` 调整；可使用 `--parallelism 4` 并发运行四条独立的完整任务链路。两类报告都会说明基线与候选技术、功能、代码逻辑优化、规则变化以及指标门禁。该实验用于证明“反馈驱动的提示词版本确实改变 Agent 行为并通过隐藏集门禁”，数据来源仍是 `synthetic-controlled`，因此生产来源门禁保持失败；它不应被表述为外部 LLM 权重提升或真实公开 PR 上的生产效果。
 
 ## Skill 自进化
 
