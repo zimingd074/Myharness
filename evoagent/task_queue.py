@@ -143,7 +143,7 @@ class TaskQueue:
                 return True
         return False
 
-    def close(self, wait: bool = False) -> None:
+    def close(self, wait: bool = True) -> None:
         self._stop.set()
         if self._consumer:
             self._consumer.shutdown()

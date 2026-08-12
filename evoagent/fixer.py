@@ -117,6 +117,7 @@ class SafeFixer:
             tree.body.insert(0, ast.Import(names=[ast.alias(name="os")]))
         ast.fix_missing_locations(tree)
         value = ast.unparse(tree) + "\n"
+        value = re.sub(r"os\.environ\['([^']+)'\]", r'os.environ["\1"]', value)
         compile(value, path, "exec")
         return {"content": value, "rules": sorted(set(changed))}
 
