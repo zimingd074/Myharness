@@ -262,6 +262,7 @@ class AgentLoopResult:
     observations: List[Dict[str, Any]]
     stop_reason: str
     loop_context: Dict[str, Any] = field(default_factory=dict)
+    usage: Dict[str, Any] = field(default_factory=dict)
 
 
 class AgentLoop:
@@ -285,6 +286,23 @@ class AgentLoop:
         self.hard_compact_ratio = hard_compact_ratio
         self.context_budget = context_budget
 
+    @staticmethod
+    def _locator_metadata(value: Any) -> Dict[str, Any]:
+        """Retain bounded provenance fields without duplicating raw tool output."""
+        if not isinstance(value, dict):
+            return {}
+        result = {}
+        for key in ("path", "line", "start_line", "end_line", "symbol", "kind"):
+            if value.get(key) is not None:
+                result[key] = value[key]
+        hits = value.get("hits")
+        if isinstance(hits, list):
+            result["locations"] = [
+                {key: item[key] for key in ("path", "line", "kind") if key in item}
+                for item in hits[:20] if isinstance(item, dict)
+            ]
+        return result
+
     def run(
         self, stepper: Callable[[Dict[str, Any]], Dict[str, Any]],
         tools: Any, initial_state: Dict[str, Any],
@@ -294,6 +312,10 @@ class AgentLoop:
         observations = list(state.get("observations") or [])
         loop_context = LoopContext(self.active_rounds, self.soft_compact_ratio, self.hard_compact_ratio)
         started = time.monotonic()
+        usage = {
+            "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+            "llm_calls": 0, "usage_source": "provider",
+        }
 
         def emit(kind: str, **detail) -> None:
             if event_sink:
@@ -310,6 +332,12 @@ class AgentLoop:
             if not isinstance(action, dict):
                 raise AgentLoopProtocolError("agent loop action must be an object")
             kind = str(action.get("action", "")).strip().lower()
+            action_usage = dict(action.get("_usage") or {})
+            usage["llm_calls"] += 1
+            for field in ("input_tokens", "output_tokens", "cached_tokens"):
+                usage[field] += int(action_usage.get(field, 0) or 0)
+            if action_usage.get("usage_source") != "provider":
+                usage["usage_source"] = "estimated"
             emit("agent_loop_action", step=step, action=kind)
             if kind == "final":
                 output = action.get("findings", action.get("output"))
@@ -327,7 +355,7 @@ class AgentLoop:
                         )
                 return AgentLoopResult(
                     output, step,
-                    observations, "final", loop_context.render(),
+                    observations, "final", loop_context.render(), usage,
                 )
             if kind != "tool":
                 raise AgentLoopProtocolError("unsupported agent loop action: %s" % kind)
@@ -353,6 +381,7 @@ class AgentLoop:
                 observation = {
                     "step": step, "tool": tool_name, "ok": True,
                     "result": rendered,
+                    "locator": self._locator_metadata(value),
                 }
             except Exception as exc:
                 observation = {
@@ -363,6 +392,8 @@ class AgentLoop:
             observation.update({
                 "shard_id": str(state.get("shard_identity", {}).get("id", "")),
                 "agent": str(state.get("assignment", {}).get("agent", "")),
+                "snapshot_id": str(state.get("snapshot_id", "")),
+                "producer_run_id": str(state.get("producer_run_id", "")),
             })
             loop_context.add_round(step, action, observation)
             evidence_refs = action.get("evidence_refs") or []

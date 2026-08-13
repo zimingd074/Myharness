@@ -1,4 +1,6 @@
 """Task-scoped, traceable evidence shared by collaboration stages."""
+import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List
 
@@ -27,13 +29,22 @@ class EvidenceLedger:
 
     def __init__(self):
         self._items: Dict[str, LedgerEvidence] = {}
+        self._aliases: Dict[str, str] = {}
 
     def record(self, values: Iterable[dict]) -> List[str]:
         added = []
         for value in values:
-            evidence_id = str(value.get("id") or value.get("evidence_id") or "")
-            if not evidence_id:
-                continue
+            identity = {
+                "supplied_id": str(value.get("id") or value.get("evidence_id") or ""),
+                "path": str(value.get("path", "")), "line": int(value.get("line", 0) or 0),
+                "tool": str(value.get("tool") or value.get("source_tool") or ""),
+                "agent": str(value.get("agent", "")), "shard_id": str(value.get("shard_id", "")),
+                "excerpt": str(value.get("excerpt", value.get("result", ""))),
+            }
+            rendered = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+            evidence_id = "E:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:24]
+            if identity["supplied_id"]:
+                self._aliases[identity["supplied_id"]] = evidence_id
             record = LedgerEvidence(
                 evidence_id=evidence_id, path=str(value.get("path", "")),
                 line=int(value.get("line", 0) or 0), excerpt=str(value.get("excerpt", "")),
@@ -47,7 +58,8 @@ class EvidenceLedger:
         return added
 
     def link(self, finding_id: str, refs: Iterable[str], path: str = "", line: int = 0) -> List[str]:
-        selected = [ref for ref in refs if ref in self._items]
+        selected = [self._aliases.get(ref, ref) for ref in refs]
+        selected = [ref for ref in selected if ref in self._items]
         if not selected and path and line:
             selected = [item.evidence_id for item in self._items.values()
                         if item.path == path and item.line == line]
@@ -63,7 +75,11 @@ class EvidenceLedger:
                    for item in self._items.values())
 
     def record_changed_line(self, finding_id: str, path: str, line: int, excerpt: str) -> str:
-        evidence_id = "F:" + finding_id
+        rendered = json.dumps({
+            "finding_id": finding_id, "path": path, "line": line,
+            "excerpt": excerpt, "tool": "changed-line",
+        }, ensure_ascii=False, sort_keys=True)
+        evidence_id = "E:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:24]
         self.record([{"id": evidence_id, "path": path, "line": line, "excerpt": excerpt,
                       "tool": "changed-line", "agent": "verification", "shard_id": ""}])
         self.link(finding_id, [evidence_id], path, line)

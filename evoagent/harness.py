@@ -30,6 +30,7 @@ class RuntimeState(TypedDict, total=False):
     parsed: Dict[str, Any]
     findings: list
     report: Dict[str, Any]
+    collaboration: Dict[str, Any]
 
 
 BudgetExceeded = RuntimeBudgetExceeded
@@ -151,16 +152,49 @@ class ReviewHarness:
         self._transition(
             TaskState.EXECUTING, "Reviewing %d changed files" % len(parsed.files)
         )
+        execution_aware = getattr(self.reviewer, "review_with_execution_context", None)
         contextual = getattr(self.reviewer, "review_with_context", None)
-        findings = (
-            contextual(
+        if execution_aware:
+            findings = execution_aware(
+                state["task_id"], state["diff"], parsed,
+                {
+                    "run_token": self.run_token, "claim_token": self.claim_token,
+                    "runtime_fingerprint": self.runtime_fingerprint,
+                },
+                repository=state["repository"], tenant_id=state.get("tenant_id", "default"),
+                pull_request=state.get("pull_request"),
+            )
+        elif contextual:
+            findings = contextual(
                 state["task_id"], state["diff"], parsed,
                 repository=state["repository"], tenant_id=state.get("tenant_id", "default"),
                 pull_request=state.get("pull_request"),
             )
-            if contextual else self.reviewer.review(state["diff"], parsed)
-        )
-        return {"findings": [item.to_dict() for item in findings]}
+        else:
+            findings = self.reviewer.review(state["diff"], parsed)
+        summary_reader = getattr(self.reviewer, "collaboration_summary", None)
+        collaboration = summary_reader(state["task_id"]) if summary_reader else {}
+        model_trace = list(collaboration.get("model_trace") or [])
+        if model_trace:
+            rendered = " -> ".join(
+                "%s/%s(%s%s)" % (
+                    item.get("provider", ""), item.get("model", ""),
+                    item.get("status", ""),
+                    ":%s" % item.get("fallback_reason") if item.get("fallback_reason") else "",
+                ) for item in model_trace
+            )[:1500]
+            self._ctx.step += 1
+            if not self.store.transition(
+                state["task_id"],
+                TraceEvent(self._ctx.step, TaskState.EXECUTING,
+                           "Model execution trace: " + rendered, utc_now()),
+                self.run_token, self.claim_token,
+            ):
+                raise TaskStale("task execution was superseded")
+        return {
+            "findings": [item.to_dict() for item in findings],
+            "collaboration": collaboration,
+        }
 
     def _reviewing(self, state: RuntimeState) -> Dict[str, Any]:
         parsed = self._deserialize_parsed(state["parsed"])
@@ -169,8 +203,10 @@ class ReviewHarness:
             TaskState.REVIEWING, "Validating and ranking %d findings" % len(findings)
         )
         risk = self._risk(findings)
+        collaboration = dict(state.get("collaboration") or {})
         summary_reader = getattr(self.reviewer, "collaboration_summary", None)
-        collaboration = summary_reader(state["task_id"]) if summary_reader else {}
+        if not collaboration and summary_reader:
+            collaboration = summary_reader(state["task_id"])
         if not collaboration:
             collaboration = self._persisted_collaboration_summary(state["task_id"])
         report = ReviewReport(

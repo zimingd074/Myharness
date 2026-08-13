@@ -50,8 +50,7 @@ class QueuedServiceReviewer(Reviewer):
             state = str(task.get("state", ""))
             if state == "SUCCESS":
                 self.task_states.append(state)
-                reader = getattr(self.service.reviewer, "last_collaboration_summary", None)
-                self._last_context = reader() if callable(reader) else {}
+                self._last_context = dict((task.get("report") or {}).get("collaboration") or {})
                 return [
                     Finding(
                         rule_id=item["rule_id"],

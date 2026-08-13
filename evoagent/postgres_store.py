@@ -92,6 +92,9 @@ class PostgresTaskStore:
                 sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL,
                 correlation_id TEXT NOT NULL, content_json JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL)""",
+            "ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS event_key TEXT NOT NULL DEFAULT ''",
+            "UPDATE agent_messages SET event_key='legacy:' || id WHERE event_key=''",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_event ON agent_messages(task_id,event_key)",
             """CREATE TABLE IF NOT EXISTS webhook_deliveries (
                 delivery_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_type TEXT NOT NULL,
                 payload_sha256 TEXT NOT NULL, task_id TEXT, received_at TIMESTAMPTZ NOT NULL)""",
@@ -254,10 +257,12 @@ class PostgresTaskStore:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
-                "content_json,created_at) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s)",
+                "content_json,created_at,event_key) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s) "
+                "ON CONFLICT(task_id,event_key) DO NOTHING",
                 (task_id, message["sender"], message["recipient"], message["kind"],
                  message.get("correlation_id", ""),
-                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now()),
+                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now(),
+                 message.get("event_key", "")),
             )
 
     def save_agent_memory(self, memory: Dict[str, Any]) -> Dict[str, Any]:

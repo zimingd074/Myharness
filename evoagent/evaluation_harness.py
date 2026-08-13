@@ -39,6 +39,8 @@ RULE_TO_CWE = {
     "SEC-OPEN-REDIRECT": "CWE-601",
     "SEC-LOG-FORGING": "CWE-117",
     "BUSINESS-NEGATIVE-BALANCE": "CWE-840",
+    "SEC-AUTHZ-BYPASS": "CWE-863",
+    "COR-API-ARITY": "CWE-628",
 }
 
 
@@ -312,6 +314,7 @@ class EndToEndEvaluationHarness:
         }
 
     def _run_case(self, reviewer: Reviewer, case: dict) -> Dict[str, Any]:
+        case_started = time.monotonic()
         expected = list(case["expected_findings"])
         result = {
             "id": case["id"],
@@ -338,6 +341,11 @@ class EndToEndEvaluationHarness:
             "error": None,
             "context": {},
             "changed_files": 0,
+            "predictions": [],
+            "unmatched_predictions": [],
+            "exact_case_hit": False,
+            "evaluation_expectations": dict(case.get("evaluation_expectations") or {}),
+            "duration_seconds": 0.0,
         }
         try:
             parsed = parse_unified_diff(case["diff"])
@@ -350,6 +358,7 @@ class EndToEndEvaluationHarness:
             )
             matches = one_to_one_match(expected, findings, self.line_tolerance)
             result["predicted"] = len(findings)
+            result["predictions"] = [item.to_dict() for item in findings]
             result["tp"] = len(matches)
             result["fp"] = len(findings) - len(matches)
             result["fn"] = len(expected) - len(matches)
@@ -359,6 +368,11 @@ class EndToEndEvaluationHarness:
             if callable(summary_reader):
                 result["context"] = summary_reader()
             matched_expected = set()
+            matched_predictions = {match.predicted_index for match in matches}
+            result["unmatched_predictions"] = [
+                finding.to_dict() for index, finding in enumerate(findings)
+                if index not in matched_predictions
+            ]
             for match in matches:
                 truth = expected[match.expected_index]
                 finding = findings[match.predicted_index]
@@ -394,8 +408,10 @@ class EndToEndEvaluationHarness:
                 and result["repair_attempted"] == len(expected)
                 and result["repair_passed"] == len(expected)
             )
+            result["exact_case_hit"] = not result["fp"] and not result["fn"]
         except Exception as exc:
             result["error"] = str(exc)[:1000]
+        result["duration_seconds"] = round(time.monotonic() - case_started, 4)
         return result
 
     @staticmethod
@@ -407,6 +423,8 @@ class EndToEndEvaluationHarness:
             "repair_passed": 0, "e2e_successes": 0,
             "input_tokens": 0, "max_input_tokens": 0, "tool_calls": 0, "repo_tool_calls": 0,
             "llm_calls": 0,
+            "output_tokens": 0, "cached_tokens": 0,
+            "budget_violations": 0, "review_completes": 0,
             "shards": 0, "cross_shard_findings": 0, "coverage_gaps": 0,
             "llm_failures": 0,
             "retrieved_context_tokens": 0, "context_compaction_count": 0,
@@ -435,6 +453,10 @@ class EndToEndEvaluationHarness:
         totals["tool_calls"] += int(context.get("tool_calls", 0))
         totals["repo_tool_calls"] += int(context.get("repo_tool_calls", 0))
         totals["llm_calls"] += int(context.get("llm_calls", 0))
+        totals["output_tokens"] += int(context.get("total_output_tokens", 0))
+        totals["cached_tokens"] += int(context.get("total_cached_tokens", 0))
+        totals["budget_violations"] += len((context.get("budget") or {}).get("violations", []))
+        totals["review_completes"] += int(bool(context.get("review_complete", False)))
         totals["shards"] += int(context.get("shard_count", 0))
         totals["cross_shard_findings"] += int(context.get("cross_shard_findings", 0))
         totals["coverage_gaps"] += len(context.get("coverage_gaps", []))
@@ -470,6 +492,7 @@ class EndToEndEvaluationHarness:
             "execution_success_rate": ratio(
                 totals["execution_successes"], totals["cases"], 0.0
             ),
+            "review_complete_rate": ratio(totals["review_completes"], totals["cases"], 0.0),
             "safe_fix_rate": ratio(
                 totals["repair_passed"], totals["repair_attempted"], 0.0
             ),

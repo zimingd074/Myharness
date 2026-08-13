@@ -187,6 +187,12 @@ class TaskStore:
                     FOREIGN KEY(task_id) REFERENCES tasks(id)
                 )"""
             )
+            self._ensure_column(conn, "agent_messages", "event_key", "TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE agent_messages SET event_key='legacy:' || id WHERE event_key=''")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_event "
+                "ON agent_messages(task_id,event_key)"
+            )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS webhook_deliveries (
                     delivery_id TEXT PRIMARY KEY,
@@ -439,11 +445,12 @@ class TaskStore:
     def record_agent_message(self, task_id: str, message: Dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
-                "content_json,created_at) VALUES (?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
+                "content_json,created_at,event_key) VALUES (?,?,?,?,?,?,?,?)",
                 (task_id, message["sender"], message["recipient"], message["kind"],
                  message.get("correlation_id", ""),
-                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now()),
+                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now(),
+                 message.get("event_key", "")),
             )
 
     def save_agent_memory(self, memory: Dict[str, Any]) -> Dict[str, Any]:

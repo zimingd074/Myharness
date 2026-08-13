@@ -19,8 +19,9 @@ from .observability import AlertManager, Observability
 from .postgres_store import create_store
 from .report import to_markdown
 from .reviewer import (
-    ContextRuleReviewer, LocalRuleReviewer, OpenAICompatibleReviewer, ReliabilityRuleReviewer,
-    SecurityRuleReviewer,
+    ContextRuleReviewer, EvidenceChallengeAgent, LocalRuleReviewer,
+    OpenAICompatibleReviewer, PrimaryReviewAgent, ReliabilityImpactAgent,
+    ReliabilityRuleReviewer, SecurityInvestigatorAgent, SecurityRuleReviewer,
 )
 from .diff_parser import parse_unified_diff
 from .skills import SkillRegistry
@@ -39,6 +40,10 @@ class ReviewService:
             settings.timeout_seconds, settings.agent_runtime_timeout_seconds,
         )
         self.llm_config = {} if settings.llm_mode == "disabled" else settings.resolved_llm()
+        self.llm_fallback_config = (
+            {} if settings.llm_mode == "disabled" or not self.llm_config
+            else settings.resolved_llm_fallback()
+        )
         if settings.llm_mode == "required" and not self.llm_config:
             raise ValueError("EVOAGENT_LLM_MODE=required needs a configured LLM provider")
         self.store = create_store(settings.database_url, settings.db_path)
@@ -123,7 +128,7 @@ class ReviewService:
     def _build_llm_reviewer(self, prompt: str = "") -> OpenAICompatibleReviewer:
         if not self.llm_config:
             raise RuntimeError("no LLM provider is configured")
-        return OpenAICompatibleReviewer(
+        return PrimaryReviewAgent(
             str(self.llm_config["base_url"]),
             str(self.llm_config["api_key"]),
             str(self.llm_config["model"]),
@@ -131,6 +136,7 @@ class ReviewService:
             system_prompt=prompt,
             provider=str(self.llm_config["provider"]),
             extra_headers=dict(self.llm_config.get("headers") or {}),
+            fallback=self.llm_fallback_config,
         )
 
     def _build_coordinator(self, reviewers: list) -> MultiAgentCoordinator:
@@ -147,6 +153,22 @@ class ReviewService:
                 ) if head else None
             except Exception:
                 return None
+        effective_mode = self.settings.review_mode if self.llm_config else "rules_only"
+        if effective_mode == "adaptive_multi_agent" and self.llm_config:
+            args = (
+                str(self.llm_config["base_url"]), str(self.llm_config["api_key"]),
+                str(self.llm_config["model"]), self.settings.llm_request_timeout_seconds,
+            )
+            common = {
+                "provider": str(self.llm_config["provider"]),
+                "extra_headers": dict(self.llm_config.get("headers") or {}),
+                "fallback": self.llm_fallback_config,
+            }
+            reviewers = list(reviewers) + [
+                SecurityInvestigatorAgent(*args, **common),
+                ReliabilityImpactAgent(*args, **common),
+                EvidenceChallengeAgent(*args, **common),
+            ]
         return MultiAgentCoordinator(
             reviewers, max_workers=self.settings.agent_max_workers, store=self.store,
             agent_retries=self.settings.agent_retries,
@@ -164,6 +186,18 @@ class ReviewService:
             shard_file_threshold=self.settings.context_shard_file_threshold,
             shard_changed_line_threshold=self.settings.context_shard_changed_line_threshold,
             snapshot_factory=snapshot_factory,
+            review_mode=effective_mode,
+            challenge_strategy=(
+                "independent_challenger" if effective_mode == "adaptive_multi_agent"
+                else "self_reflect"
+            ),
+            agent_budget={
+                "max_agent_runs": self.settings.agent_budget_max_runs,
+                "max_llm_calls": self.settings.agent_budget_max_llm_calls,
+                "max_tool_calls": self.settings.agent_budget_max_tool_calls,
+                "max_input_tokens": self.settings.agent_budget_max_input_tokens,
+                "max_output_tokens": self.settings.agent_budget_max_output_tokens,
+            },
         )
 
     def _candidate_reviewer(self, tenant_id: str):
