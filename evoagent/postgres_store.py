@@ -6,6 +6,8 @@ dependency so local development can remain zero-config.
 """
 import hashlib
 import json
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from .models import ReviewReport, TaskState, TraceEvent
@@ -72,11 +74,16 @@ class PostgresTaskStore:
             "ALTER TABLE skill_evolution_runs ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS run_token TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS run_claim_token TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS run_claimed_until TIMESTAMPTZ",
             "ALTER TABLE installations ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
             """CREATE TABLE IF NOT EXISTS checkpoints (
                 task_id TEXT NOT NULL REFERENCES tasks(id), node TEXT NOT NULL, status TEXT NOT NULL,
                 attempt INTEGER NOT NULL DEFAULT 1, state_json JSONB NOT NULL, error TEXT,
-                updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(task_id,node))""",
+                updated_at TIMESTAMPTZ NOT NULL, fingerprint TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(task_id,node))""",
+            "ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS fingerprint TEXT NOT NULL DEFAULT ''",
             """CREATE TABLE IF NOT EXISTS task_payloads (
                 task_id TEXT PRIMARY KEY REFERENCES tasks(id), diff TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL)""",
@@ -85,6 +92,9 @@ class PostgresTaskStore:
                 sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL,
                 correlation_id TEXT NOT NULL, content_json JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL)""",
+            "ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS event_key TEXT NOT NULL DEFAULT ''",
+            "UPDATE agent_messages SET event_key='legacy:' || id WHERE event_key=''",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_event ON agent_messages(task_id,event_key)",
             """CREATE TABLE IF NOT EXISTS webhook_deliveries (
                 delivery_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_type TEXT NOT NULL,
                 payload_sha256 TEXT NOT NULL, task_id TEXT, received_at TIMESTAMPTZ NOT NULL)""",
@@ -113,6 +123,9 @@ class PostgresTaskStore:
                 severity TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
                 created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
                 UNIQUE(tenant_id,alert_key,status))""",
+            """CREATE TABLE IF NOT EXISTS queue_dead_letters (
+                message_id TEXT PRIMARY KEY, payload_json JSONB NOT NULL,
+                error TEXT NOT NULL, failed_at TIMESTAMPTZ NOT NULL)""",
             """CREATE TABLE IF NOT EXISTS agent_memories (
                 id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
                 task_id TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT '',
@@ -142,35 +155,70 @@ class PostgresTaskStore:
                  json.dumps(payload), now, now, tenant_id),
             )
 
-    def transition(self, task_id: str, event: TraceEvent) -> None:
+    def transition(
+        self, task_id: str, event: TraceEvent, run_token: str = "", claim_token: str = "",
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute("UPDATE tasks SET state=%s,updated_at=%s WHERE id=%s", (event.state.value, event.created_at, task_id))
+            query = "UPDATE tasks SET state=%s,updated_at=%s WHERE id=%s"
+            params = [event.state.value, event.created_at, task_id]
+            if run_token:
+                query += " AND run_token=%s"
+                params.append(run_token)
+            if claim_token:
+                query += " AND run_claim_token=%s"
+                params.append(claim_token)
+            cursor = conn.execute(query, params)
+            if cursor.rowcount != 1:
+                return False
             conn.execute(
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            return True
 
-    def succeed(self, task_id: str, report: ReviewReport, event: TraceEvent) -> None:
+    def succeed(
+        self, task_id: str, report: ReviewReport, event: TraceEvent,
+        run_token: str = "", claim_token: str = "",
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET state=%s,report_json=%s::jsonb,updated_at=%s WHERE id=%s",
-                (TaskState.SUCCESS.value, json.dumps(report.to_dict(), ensure_ascii=False), event.created_at, task_id),
-            )
+            query = "UPDATE tasks SET state=%s,report_json=%s::jsonb,updated_at=%s WHERE id=%s"
+            params = [TaskState.SUCCESS.value, json.dumps(report.to_dict(), ensure_ascii=False), event.created_at, task_id]
+            if run_token:
+                query += " AND run_token=%s"
+                params.append(run_token)
+            if claim_token:
+                query += " AND run_claim_token=%s"
+                params.append(claim_token)
+            cursor = conn.execute(query, params)
+            if cursor.rowcount != 1:
+                return False
             conn.execute(
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            return True
 
-    def fail(self, task_id: str, error: str, event: TraceEvent) -> None:
+    def fail(
+        self, task_id: str, error: str, event: TraceEvent,
+        run_token: str = "", claim_token: str = "",
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET state=%s,error=%s,updated_at=%s WHERE id=%s",
-                (TaskState.FAILED.value, error[:2000], event.created_at, task_id),
-            )
+            query = "UPDATE tasks SET state=%s,error=%s,updated_at=%s WHERE id=%s"
+            params = [TaskState.FAILED.value, error[:2000], event.created_at, task_id]
+            if run_token:
+                query += " AND run_token=%s"
+                params.append(run_token)
+            if claim_token:
+                query += " AND run_claim_token=%s"
+                params.append(claim_token)
+            cursor = conn.execute(query, params)
+            if cursor.rowcount != 1:
+                return False
             conn.execute(
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            return True
 
     def get(self, task_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -209,10 +257,12 @@ class PostgresTaskStore:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
-                "content_json,created_at) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s)",
+                "content_json,created_at,event_key) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s) "
+                "ON CONFLICT(task_id,event_key) DO NOTHING",
                 (task_id, message["sender"], message["recipient"], message["kind"],
                  message.get("correlation_id", ""),
-                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now()),
+                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now(),
+                 message.get("event_key", "")),
             )
 
     def save_agent_memory(self, memory: Dict[str, Any]) -> Dict[str, Any]:
@@ -222,7 +272,9 @@ class PostgresTaskStore:
                 "content,keywords_json,metadata_json,importance,created_at,expires_at) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s) "
                 "ON CONFLICT(id) DO UPDATE SET "
-                "importance=GREATEST(agent_memories.importance,EXCLUDED.importance),"
+                "task_id=EXCLUDED.task_id,agent=EXCLUDED.agent,scope=EXCLUDED.scope,"
+                "kind=EXCLUDED.kind,content=EXCLUDED.content,keywords_json=EXCLUDED.keywords_json,"
+                "metadata_json=EXCLUDED.metadata_json,importance=EXCLUDED.importance,"
                 "expires_at=EXCLUDED.expires_at RETURNING *",
                 (
                     memory["id"], memory["tenant_id"], memory["repository"],
@@ -638,22 +690,38 @@ class PostgresTaskStore:
 
     def save_checkpoint(
         self, task_id: str, node: str, state: Dict[str, Any], status: str = "completed",
-        attempt: int = 1, error: str = "",
-    ) -> None:
+        attempt: int = 1, error: str = "", fingerprint: str = "", run_token: str = "",
+        claim_token: str = "",
+    ) -> bool:
         with self._connect() as conn:
+            if run_token:
+                cursor = conn.execute(
+                    "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at,fingerprint) "
+                    "SELECT %s,%s,%s,%s,%s::jsonb,%s,%s,%s WHERE EXISTS "
+                    "(SELECT 1 FROM tasks WHERE id=%s AND run_token=%s AND run_claim_token=%s) "
+                    "ON CONFLICT(task_id,node) DO UPDATE SET "
+                    "status=EXCLUDED.status,attempt=EXCLUDED.attempt,state_json=EXCLUDED.state_json,"
+                    "error=EXCLUDED.error,updated_at=EXCLUDED.updated_at,fingerprint=EXCLUDED.fingerprint "
+                    "WHERE EXISTS (SELECT 1 FROM tasks WHERE id=%s AND run_token=%s AND run_claim_token=%s)",
+                    (task_id, node, status, attempt, json.dumps(state, ensure_ascii=False),
+                     error[:2000] or None, utc_now(), fingerprint, task_id, run_token, claim_token,
+                     task_id, run_token, claim_token),
+                )
+                return cursor.rowcount == 1
             conn.execute(
-                "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at) "
-                "VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s) ON CONFLICT(task_id,node) DO UPDATE SET "
+                "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at,fingerprint) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s,%s) ON CONFLICT(task_id,node) DO UPDATE SET "
                 "status=EXCLUDED.status,attempt=EXCLUDED.attempt,state_json=EXCLUDED.state_json,"
-                "error=EXCLUDED.error,updated_at=EXCLUDED.updated_at",
+                "error=EXCLUDED.error,updated_at=EXCLUDED.updated_at,fingerprint=EXCLUDED.fingerprint",
                 (task_id, node, status, attempt, json.dumps(state, ensure_ascii=False),
-                 error[:2000] or None, utc_now()),
+                 error[:2000] or None, utc_now(), fingerprint),
             )
+            return True
 
     def load_checkpoints(self, task_id: str) -> Dict[str, Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT node,status,attempt,state_json,error,updated_at FROM checkpoints "
+                "SELECT node,status,attempt,state_json,error,updated_at,fingerprint FROM checkpoints "
                 "WHERE task_id=%s ORDER BY updated_at", (task_id,)
             ).fetchall()
         result = {}
@@ -663,6 +731,38 @@ class PostgresTaskStore:
             item["updated_at"] = item["updated_at"].isoformat()
             result[item.pop("node")] = item
         return result
+
+    def issue_run_token(self, task_id: str) -> str:
+        token = uuid.uuid4().hex
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET run_token=%s,run_claim_token='',run_claimed_until=NULL,updated_at=%s WHERE id=%s",
+                (token, utc_now(), task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("task not found")
+        return token
+
+    def claim_run(
+        self, task_id: str, run_token: str, claim_token: str, lease_seconds: int,
+    ) -> bool:
+        now = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET run_claim_token=%s,run_claimed_until=%s WHERE id=%s AND run_token=%s "
+                "AND (run_claimed_until IS NULL OR run_claimed_until < %s)",
+                (claim_token, now + timedelta(seconds=lease_seconds), task_id, run_token, now),
+            )
+            return cursor.rowcount == 1
+
+    def release_run(self, task_id: str, run_token: str, claim_token: str = "") -> None:
+        with self._connect() as conn:
+            query = "UPDATE tasks SET run_claimed_until=NULL WHERE id=%s AND run_token=%s"
+            params = [task_id, run_token]
+            if claim_token:
+                query += " AND run_claim_token=%s"
+                params.append(claim_token)
+            conn.execute(query, params)
 
     def request_cancel(self, task_id: str, tenant_id: Optional[str] = None) -> bool:
         query = "UPDATE tasks SET cancel_requested=TRUE,updated_at=%s WHERE id=%s"
@@ -681,17 +781,27 @@ class PostgresTaskStore:
             ).fetchone()
         return bool(row and row["cancel_requested"])
 
-    def cancel(self, task_id: str, event: TraceEvent) -> None:
+    def cancel(
+        self, task_id: str, event: TraceEvent, run_token: str = "", claim_token: str = "",
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET state=%s,updated_at=%s WHERE id=%s",
-                (TaskState.CANCELLED.value, event.created_at, task_id),
-            )
+            query = "UPDATE tasks SET state=%s,updated_at=%s WHERE id=%s"
+            params = [TaskState.CANCELLED.value, event.created_at, task_id]
+            if run_token:
+                query += " AND run_token=%s"
+                params.append(run_token)
+            if claim_token:
+                query += " AND run_claim_token=%s"
+                params.append(claim_token)
+            cursor = conn.execute(query, params)
+            if cursor.rowcount != 1:
+                return False
             conn.execute(
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) "
                 "VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            return True
 
     def claim_webhook(
         self, delivery_id: str, tenant_id: str, event_type: str, payload_sha256: str,
@@ -868,6 +978,34 @@ class PostgresTaskStore:
                 (tenant_id, max(1, min(limit, 500))),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_dead_letter(self, message_id: str, payload: Dict[str, Any], error: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO queue_dead_letters(message_id,payload_json,error,failed_at) "
+                "VALUES (%s,%s::jsonb,%s,%s) ON CONFLICT(message_id) DO UPDATE SET "
+                "payload_json=EXCLUDED.payload_json,error=EXCLUDED.error,failed_at=EXCLUDED.failed_at",
+                (message_id, json.dumps(payload, ensure_ascii=False), error[:2000], utc_now()),
+            )
+
+    def list_dead_letters(self, limit: int = 100) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM queue_dead_letters ORDER BY failed_at DESC LIMIT %s",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dead_letter(self, message_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM queue_dead_letters WHERE message_id=%s", (message_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def remove_dead_letter(self, message_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM queue_dead_letters WHERE message_id=%s", (message_id,))
 
     def save_installation(
         self, installation_id: int, account_login: str, tenant_id: str = "default"

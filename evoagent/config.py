@@ -78,18 +78,48 @@ class Settings:
     github_token: str
     auto_post_review: bool
     database_url: str = ""
-    redis_url: str = ""
+    rocketmq_nameserver: str = ""
     async_workers: int = 2
     agent_max_workers: int = 4
     agent_retries: int = 1
     collaboration_rounds: int = 2
-    agent_loop_max_steps: int = 4
-    agent_loop_timeout_seconds: int = 45
+    # A large PR has a bounded loop per responsible Specialist × Shard.  These
+    # defaults leave room for retrieval and verification without allowing an
+    # individual request to consume the whole review deadline.
+    agent_loop_max_steps: int = 6
+    agent_loop_timeout_seconds: int = 120
+    agent_runtime_max_steps: int = 8
+    agent_runtime_timeout_seconds: int = 300
+    llm_request_timeout_seconds: int = 60
+    llm_mode: str = "controlled"
+    # Independent challenge is the validated default when an LLM is
+    # configured. ReviewService still resolves this to rules_only when no LLM
+    # endpoint is available or LLM usage is disabled.
+    review_mode: str = "adaptive_multi_agent"
+    # The bounded graph gives verification and reverse audit separate agents.
+    # Keep the legacy topology available as an explicit compatibility switch.
+    review_pipeline: str = "bounded-v2"
+    agent_budget_max_runs: int = 4
+    agent_budget_max_llm_calls: int = 12
+    agent_budget_max_tool_calls: int = 24
+    agent_budget_max_input_tokens: int = 60000
+    agent_budget_max_output_tokens: int = 12000
     context_max_tokens: int = 12000
     context_reserved_tokens: int = 2500
+    context_architecture: str = "coverage-first"
+    # The latest real three-arm evaluation did not meet hybrid's no-gap
+    # acceptance gate, so fail closed to full specialist activation. Operators
+    # may explicitly set hybrid after validating their provider's stability.
+    context_specialist_activation: str = "all"
+    context_shard_file_threshold: int = 12
+    context_shard_changed_line_threshold: int = 1200
+    context_active_rounds: int = 3
+    context_soft_compact_ratio: float = 0.60
+    context_hard_compact_ratio: float = 0.80
     memory_enabled: bool = True
     memory_recall_limit: int = 6
     memory_working_ttl_seconds: int = 86400
+    memory_promotion_support_threshold: int = 2
     skills_dir: str = "skills"
     github_app_id: str = ""
     github_app_slug: str = ""
@@ -97,6 +127,9 @@ class Settings:
     public_base_url: str = "http://127.0.0.1:8080"
     llm_provider: str = "local"
     deepseek_api_key: str = ""
+    llm_fallback_provider: str = ""
+    llm_fallback_base_url: str = ""
+    llm_fallback_model: str = ""
     openrouter_api_key: str = ""
     openrouter_site_url: str = ""
     openrouter_app_name: str = "EvoAgent"
@@ -201,6 +234,24 @@ class Settings:
             }
         raise ValueError("unsupported EVOAGENT_LLM_PROVIDER: %s" % self.llm_provider)
 
+    def resolved_llm_fallback(self) -> Dict[str, object]:
+        provider = self.llm_fallback_provider.strip().lower()
+        if not provider and self.deepseek_api_key and self.llm_provider.strip().lower() != "deepseek":
+            provider = "deepseek"
+        if not provider or provider in {"none", "disabled"}:
+            return {}
+        if provider != "deepseek":
+            raise ValueError("unsupported EVOAGENT_LLM_FALLBACK_PROVIDER: %s" % provider)
+        if not self.deepseek_api_key:
+            raise ValueError("DeepSeek fallback requires EVOAGENT_DEEPSEEK_API_KEY")
+        return {
+            "provider": "deepseek",
+            "base_url": self.llm_fallback_base_url or "https://api.deepseek.com",
+            "api_key": self.deepseek_api_key,
+            "model": self.llm_fallback_model or "deepseek-v4-flash",
+            "headers": {},
+        }
+
     def validate_evolution(self) -> None:
         if self.eval_min_cases > self.eval_max_cases:
             raise ValueError("EVOAGENT_EVAL_MIN_CASES cannot exceed EVOAGENT_EVAL_MAX_CASES")
@@ -226,12 +277,43 @@ class Settings:
             raise ValueError("EVOAGENT_COLLABORATION_ROUNDS must be at least 1")
         if self.agent_loop_max_steps < 1:
             raise ValueError("EVOAGENT_AGENT_LOOP_MAX_STEPS must be at least 1")
+        if self.agent_runtime_max_steps < 7:
+            raise ValueError("EVOAGENT_AGENT_RUNTIME_MAX_STEPS must allow the review protocol")
+        if self.agent_runtime_timeout_seconds < self.agent_loop_timeout_seconds:
+            raise ValueError("EVOAGENT_AGENT_RUNTIME_TIMEOUT_SECONDS cannot be below loop timeout")
+        if self.llm_request_timeout_seconds < 1:
+            raise ValueError("EVOAGENT_LLM_REQUEST_TIMEOUT_SECONDS must be at least 1")
+        if self.llm_mode not in {"controlled", "required", "disabled"}:
+            raise ValueError("EVOAGENT_LLM_MODE must be controlled, required or disabled")
+        if self.review_mode not in {"rules_only", "single_agent", "adaptive_multi_agent"}:
+            raise ValueError(
+                "EVOAGENT_REVIEW_MODE must be rules_only, single_agent or adaptive_multi_agent"
+            )
+        if self.review_pipeline not in {"classic", "bounded-v2"}:
+            raise ValueError("EVOAGENT_REVIEW_PIPELINE must be classic or bounded-v2")
+        for name, value in (
+            ("EVOAGENT_AGENT_BUDGET_MAX_RUNS", self.agent_budget_max_runs),
+            ("EVOAGENT_AGENT_BUDGET_MAX_LLM_CALLS", self.agent_budget_max_llm_calls),
+            ("EVOAGENT_AGENT_BUDGET_MAX_TOOL_CALLS", self.agent_budget_max_tool_calls),
+            ("EVOAGENT_AGENT_BUDGET_MAX_INPUT_TOKENS", self.agent_budget_max_input_tokens),
+            ("EVOAGENT_AGENT_BUDGET_MAX_OUTPUT_TOKENS", self.agent_budget_max_output_tokens),
+        ):
+            if value < 1:
+                raise ValueError("%s must be at least 1" % name)
         if self.context_max_tokens < 512:
             raise ValueError("EVOAGENT_CONTEXT_MAX_TOKENS must be at least 512")
         if not 0 <= self.context_reserved_tokens < self.context_max_tokens:
             raise ValueError(
                 "EVOAGENT_CONTEXT_RESERVED_TOKENS must be smaller than the context budget"
             )
+        if self.context_architecture not in {"legacy", "coverage-first"}:
+            raise ValueError("EVOAGENT_CONTEXT_ARCHITECTURE must be legacy or coverage-first")
+        if self.context_specialist_activation not in {"directed", "hybrid", "all"}:
+            raise ValueError("EVOAGENT_CONTEXT_SPECIALIST_ACTIVATION must be directed, hybrid or all")
+        if not 0 < self.context_soft_compact_ratio < self.context_hard_compact_ratio < 1:
+            raise ValueError("context compact ratios must satisfy 0 < soft < hard < 1")
+        if self.memory_promotion_support_threshold < 1:
+            raise ValueError("EVOAGENT_MEMORY_PROMOTION_SUPPORT_THRESHOLD must be at least 1")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -249,21 +331,42 @@ class Settings:
             github_token=os.getenv("EVOAGENT_GITHUB_TOKEN", ""),
             auto_post_review=_bool("EVOAGENT_AUTO_POST_REVIEW"),
             database_url=os.getenv("EVOAGENT_DATABASE_URL", ""),
-            redis_url=os.getenv("EVOAGENT_REDIS_URL", ""),
+            rocketmq_nameserver=os.getenv("EVOAGENT_ROCKETMQ_NAMESERVER", ""),
             async_workers=_int("EVOAGENT_ASYNC_WORKERS", 2),
             agent_max_workers=_int("EVOAGENT_AGENT_MAX_WORKERS", 4),
             agent_retries=_non_negative_int("EVOAGENT_AGENT_RETRIES", 1),
             collaboration_rounds=_int("EVOAGENT_COLLABORATION_ROUNDS", 2),
-            agent_loop_max_steps=_int("EVOAGENT_AGENT_LOOP_MAX_STEPS", 4),
-            agent_loop_timeout_seconds=_int("EVOAGENT_AGENT_LOOP_TIMEOUT_SECONDS", 45),
+            agent_loop_max_steps=_int("EVOAGENT_AGENT_LOOP_MAX_STEPS", 6),
+            agent_loop_timeout_seconds=_int("EVOAGENT_AGENT_LOOP_TIMEOUT_SECONDS", 120),
+            agent_runtime_max_steps=_int("EVOAGENT_AGENT_RUNTIME_MAX_STEPS", 8),
+            agent_runtime_timeout_seconds=_int("EVOAGENT_AGENT_RUNTIME_TIMEOUT_SECONDS", 300),
+            llm_request_timeout_seconds=_int("EVOAGENT_LLM_REQUEST_TIMEOUT_SECONDS", 60),
+            llm_mode=os.getenv("EVOAGENT_LLM_MODE", "controlled").strip().lower(),
+            review_mode=os.getenv("EVOAGENT_REVIEW_MODE", "adaptive_multi_agent").strip().lower(),
+            review_pipeline=os.getenv("EVOAGENT_REVIEW_PIPELINE", "bounded-v2").strip().lower(),
+            agent_budget_max_runs=_int("EVOAGENT_AGENT_BUDGET_MAX_RUNS", 4),
+            agent_budget_max_llm_calls=_int("EVOAGENT_AGENT_BUDGET_MAX_LLM_CALLS", 12),
+            agent_budget_max_tool_calls=_int("EVOAGENT_AGENT_BUDGET_MAX_TOOL_CALLS", 24),
+            agent_budget_max_input_tokens=_int("EVOAGENT_AGENT_BUDGET_MAX_INPUT_TOKENS", 60000),
+            agent_budget_max_output_tokens=_int("EVOAGENT_AGENT_BUDGET_MAX_OUTPUT_TOKENS", 12000),
             context_max_tokens=_int("EVOAGENT_CONTEXT_MAX_TOKENS", 12000),
             context_reserved_tokens=_non_negative_int(
                 "EVOAGENT_CONTEXT_RESERVED_TOKENS", 2500
             ),
+            context_architecture=os.getenv("EVOAGENT_CONTEXT_ARCHITECTURE", "coverage-first"),
+            context_specialist_activation=os.getenv("EVOAGENT_CONTEXT_SPECIALIST_ACTIVATION", "all"),
+            context_shard_file_threshold=_int("EVOAGENT_CONTEXT_SHARD_FILE_THRESHOLD", 12),
+            context_shard_changed_line_threshold=_int("EVOAGENT_CONTEXT_SHARD_CHANGED_LINE_THRESHOLD", 1200),
+            context_active_rounds=_int("EVOAGENT_CONTEXT_ACTIVE_ROUNDS", 3),
+            context_soft_compact_ratio=float(os.getenv("EVOAGENT_CONTEXT_SOFT_COMPACT_RATIO", "0.60")),
+            context_hard_compact_ratio=float(os.getenv("EVOAGENT_CONTEXT_HARD_COMPACT_RATIO", "0.80")),
             memory_enabled=_bool("EVOAGENT_MEMORY_ENABLED", True),
             memory_recall_limit=_int("EVOAGENT_MEMORY_RECALL_LIMIT", 6),
             memory_working_ttl_seconds=_int(
                 "EVOAGENT_MEMORY_WORKING_TTL_SECONDS", 86400
+            ),
+            memory_promotion_support_threshold=_int(
+                "EVOAGENT_MEMORY_PROMOTION_SUPPORT_THRESHOLD", 2
             ),
             skills_dir=os.getenv("EVOAGENT_SKILLS_DIR", "skills"),
             github_app_id=os.getenv("EVOAGENT_GITHUB_APP_ID", ""),
@@ -276,6 +379,9 @@ class Settings:
             deepseek_api_key=os.getenv(
                 "EVOAGENT_DEEPSEEK_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")
             ),
+            llm_fallback_provider=os.getenv("EVOAGENT_LLM_FALLBACK_PROVIDER", ""),
+            llm_fallback_base_url=os.getenv("EVOAGENT_LLM_FALLBACK_BASE_URL", "").rstrip("/"),
+            llm_fallback_model=os.getenv("EVOAGENT_LLM_FALLBACK_MODEL", ""),
             openrouter_api_key=os.getenv("EVOAGENT_OPENROUTER_API_KEY", ""),
             openrouter_site_url=os.getenv("EVOAGENT_OPENROUTER_SITE_URL", ""),
             openrouter_app_name=os.getenv("EVOAGENT_OPENROUTER_APP_NAME", "EvoAgent"),

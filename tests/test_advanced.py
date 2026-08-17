@@ -60,6 +60,22 @@ class AdvancedFeatureTests(unittest.TestCase):
         )
         self.assertTrue(str(free.resolved_llm()["model"]).endswith(":free"))
 
+        primary_with_fallback = settings(self.path).__class__(**{
+            **settings(self.path).__dict__, "llm_provider": "custom",
+            "llm_base_url": "https://qwen.example/v1", "llm_api_key": "qwen-key",
+            "llm_model": "qwen3.7-max", "deepseek_api_key": "deepseek-key",
+        })
+        fallback = primary_with_fallback.resolved_llm_fallback()
+        self.assertEqual("deepseek", fallback["provider"])
+        self.assertEqual("deepseek-v4-flash", fallback["model"])
+        self.assertEqual("https://api.deepseek.com", fallback["base_url"])
+
+    def test_adaptive_is_default_but_missing_llm_fails_down_to_rules_only(self):
+        configured = settings(self.path)
+        self.assertEqual("adaptive_multi_agent", configured.review_mode)
+        service = ReviewService(configured)
+        self.assertEqual("rules_only", service.reviewer.review_mode)
+
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {"source": "test"})

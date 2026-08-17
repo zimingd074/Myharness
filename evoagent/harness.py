@@ -1,4 +1,6 @@
 """Checkpointed review workflow powered by EvoAgent's own runtime."""
+import hashlib
+import json
 import threading
 from typing import Any, Dict, Optional, TypedDict
 
@@ -6,7 +8,7 @@ from .diff_parser import ParsedDiff, parse_unified_diff
 from .models import ChangedLine, Finding, ReviewReport, Severity, TaskState, TraceEvent
 from .reviewer import Reviewer
 from .runtime import (
-    AgentRuntime, RuntimeBudgetExceeded, RuntimeCancelled, RuntimeNode,
+    AgentRuntime, RuntimeBudgetExceeded, RuntimeCancelled, RuntimeNode, RuntimeStaleRun,
 )
 from .store import TaskStore, utc_now
 
@@ -28,18 +30,23 @@ class RuntimeState(TypedDict, total=False):
     parsed: Dict[str, Any]
     findings: list
     report: Dict[str, Any]
+    collaboration: Dict[str, Any]
 
 
 BudgetExceeded = RuntimeBudgetExceeded
 TaskCancelled = RuntimeCancelled
+TaskStale = RuntimeStaleRun
 
 
 class ReviewHarness:
     node_order = ("planning", "executing", "reviewing")
+    PARSER_REVISION = "1"
+    REPORT_REVISION = "1"
 
     def __init__(
         self, store: TaskStore, reviewer: Reviewer, max_steps: int = 8,
         timeout_seconds: int = 120, node_retries: int = 2, observability=None,
+        runtime_fingerprint: str = "", run_token: str = "", claim_token: str = "",
     ):
         self.store = store
         self.reviewer = reviewer
@@ -47,6 +54,9 @@ class ReviewHarness:
         self.timeout_seconds = timeout_seconds
         self.node_retries = node_retries
         self.observability = observability
+        self.runtime_fingerprint = runtime_fingerprint or reviewer.name
+        self.run_token = run_token
+        self.claim_token = claim_token
         self.name = "evoagent-runtime"
         self._ctx = threading.local()
         self.runtime = AgentRuntime(max_steps, timeout_seconds, node_retries)
@@ -62,15 +72,18 @@ class ReviewHarness:
             "task_id": task_id, "repository": repository,
             "pull_request": pull_request, "diff": diff, "tenant_id": tenant_id,
         }
+        fingerprints = self._checkpoint_fingerprints(diff)
         self._ctx.step = max([item["step"] for item in (task or {}).get("trace", [])] or [0])
         self._ctx.task_id = task_id
         checkpoints = self.store.load_checkpoints(task_id)
         self._ctx.state = TaskState.PENDING
-        if checkpoints.get("planning", {}).get("status") == "completed":
+        if self._matches(checkpoints, "planning", fingerprints):
             self._ctx.state = TaskState.PLANNING
-        if checkpoints.get("executing", {}).get("status") == "completed":
+        if (self._ctx.state == TaskState.PLANNING
+                and self._matches(checkpoints, "executing", fingerprints)):
             self._ctx.state = TaskState.EXECUTING
-        if checkpoints.get("reviewing", {}).get("status") == "completed":
+        if (self._ctx.state == TaskState.EXECUTING
+                and self._matches(checkpoints, "reviewing", fingerprints)):
             self._ctx.state = TaskState.REVIEWING
         try:
             result = self.runtime.execute(
@@ -81,27 +94,37 @@ class ReviewHarness:
                     RuntimeNode("reviewing", self._reviewing),
                 ],
                 task_id=task_id, checkpoint_store=self.store,
+                checkpoint_fingerprints=fingerprints, run_token=self.run_token,
+                claim_token=self.claim_token,
                 cancel_check=lambda: self.store.is_cancelled(task_id),
                 span_factory=self._span,
             )
             report = self._report_from_dict(result["report"])
             self._ctx.step += 1
-            self.store.succeed(
+            if not self.store.succeed(
                 task_id, report,
                 TraceEvent(self._ctx.step, TaskState.SUCCESS, "Review completed", utc_now()),
-            )
+                self.run_token, self.claim_token,
+            ):
+                raise TaskStale("task execution was superseded")
             return report
+        except TaskStale:
+            raise
         except TaskCancelled as exc:
             self._ctx.step += 1
-            self.store.cancel(
-                task_id, TraceEvent(self._ctx.step, TaskState.CANCELLED, str(exc), utc_now())
-            )
+            if not self.store.cancel(
+                task_id,
+                TraceEvent(self._ctx.step, TaskState.CANCELLED, str(exc), utc_now()),
+                self.run_token, self.claim_token,
+            ):
+                raise TaskStale("task execution was superseded")
             raise
         except Exception as exc:
             self._ctx.step += 1
             self.store.fail(
                 task_id, str(exc),
                 TraceEvent(self._ctx.step, TaskState.FAILED, "Review failed: %s" % exc, utc_now()),
+                self.run_token, self.claim_token,
             )
             try:
                 self.store.record_failure_case(
@@ -129,15 +152,49 @@ class ReviewHarness:
         self._transition(
             TaskState.EXECUTING, "Reviewing %d changed files" % len(parsed.files)
         )
+        execution_aware = getattr(self.reviewer, "review_with_execution_context", None)
         contextual = getattr(self.reviewer, "review_with_context", None)
-        findings = (
-            contextual(
+        if execution_aware:
+            findings = execution_aware(
+                state["task_id"], state["diff"], parsed,
+                {
+                    "run_token": self.run_token, "claim_token": self.claim_token,
+                    "runtime_fingerprint": self.runtime_fingerprint,
+                },
+                repository=state["repository"], tenant_id=state.get("tenant_id", "default"),
+                pull_request=state.get("pull_request"),
+            )
+        elif contextual:
+            findings = contextual(
                 state["task_id"], state["diff"], parsed,
                 repository=state["repository"], tenant_id=state.get("tenant_id", "default"),
+                pull_request=state.get("pull_request"),
             )
-            if contextual else self.reviewer.review(state["diff"], parsed)
-        )
-        return {"findings": [item.to_dict() for item in findings]}
+        else:
+            findings = self.reviewer.review(state["diff"], parsed)
+        summary_reader = getattr(self.reviewer, "collaboration_summary", None)
+        collaboration = summary_reader(state["task_id"]) if summary_reader else {}
+        model_trace = list(collaboration.get("model_trace") or [])
+        if model_trace:
+            rendered = " -> ".join(
+                "%s/%s(%s%s)" % (
+                    item.get("provider", ""), item.get("model", ""),
+                    item.get("status", ""),
+                    ":%s" % item.get("fallback_reason") if item.get("fallback_reason") else "",
+                ) for item in model_trace
+            )[:1500]
+            self._ctx.step += 1
+            if not self.store.transition(
+                state["task_id"],
+                TraceEvent(self._ctx.step, TaskState.EXECUTING,
+                           "Model execution trace: " + rendered, utc_now()),
+                self.run_token, self.claim_token,
+            ):
+                raise TaskStale("task execution was superseded")
+        return {
+            "findings": [item.to_dict() for item in findings],
+            "collaboration": collaboration,
+        }
 
     def _reviewing(self, state: RuntimeState) -> Dict[str, Any]:
         parsed = self._deserialize_parsed(state["parsed"])
@@ -146,8 +203,10 @@ class ReviewHarness:
             TaskState.REVIEWING, "Validating and ranking %d findings" % len(findings)
         )
         risk = self._risk(findings)
+        collaboration = dict(state.get("collaboration") or {})
         summary_reader = getattr(self.reviewer, "collaboration_summary", None)
-        collaboration = summary_reader(state["task_id"]) if summary_reader else {}
+        if not collaboration and summary_reader:
+            collaboration = summary_reader(state["task_id"])
         if not collaboration:
             collaboration = self._persisted_collaboration_summary(state["task_id"])
         report = ReviewReport(
@@ -167,10 +226,36 @@ class ReviewHarness:
             )
         self._ctx.step += 1
         self._ctx.state = target
-        self.store.transition(
+        if not self.store.transition(
             self._ctx.task_id,
             TraceEvent(self._ctx.step, target, message, utc_now()),
-        )
+            self.run_token, self.claim_token,
+        ):
+            raise TaskStale("task execution was superseded")
+
+    def _checkpoint_fingerprints(self, diff: str) -> Dict[str, str]:
+        planning = self._fingerprint({
+            "diff_sha256": hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+            "parser_revision": self.PARSER_REVISION,
+        })
+        executing = self._fingerprint({
+            "planning": planning, "runtime": self.runtime_fingerprint,
+        })
+        reviewing = self._fingerprint({
+            "executing": executing, "report_revision": self.REPORT_REVISION,
+        })
+        return {"planning": planning, "executing": executing, "reviewing": reviewing}
+
+    @staticmethod
+    def _fingerprint(value: Dict[str, Any]) -> str:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _matches(checkpoints: Dict[str, Dict[str, Any]], node: str, fingerprints: Dict[str, str]) -> bool:
+        checkpoint = checkpoints.get(node, {})
+        return (checkpoint.get("status") == "completed"
+                and checkpoint.get("fingerprint") == fingerprints[node])
 
     def _span(self, name: str, attributes: Dict[str, Any]):
         if self.observability:

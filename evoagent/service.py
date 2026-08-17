@@ -1,4 +1,5 @@
 import hashlib
+import json
 import uuid
 from typing import Any, Dict, Optional
 
@@ -6,10 +7,11 @@ from .agents import MultiAgentCoordinator
 from .auth import AuthManager
 from .config import Settings
 from .context_manager import ContextManager
+from .context.retrieval import GitHubSnapshotProvider
 from .evolution import EvolutionEngine
 from .fixer import SafeFixer
 from .github import GitHubAppAuthenticator, GitHubClient
-from .harness import ReviewHarness
+from .harness import ReviewHarness, TaskStale
 from .metrics import metrics
 from .memory import MemoryManager
 from .models import TaskState, TraceEvent
@@ -17,8 +19,13 @@ from .observability import AlertManager, Observability
 from .postgres_store import create_store
 from .report import to_markdown
 from .reviewer import (
-    OpenAICompatibleReviewer, ReliabilityRuleReviewer, SecurityRuleReviewer,
+    ContextRuleReviewer, LocalRuleReviewer,
+    OpenAICompatibleReviewer, PrimaryReviewAgent, ReliabilityImpactAgent,
+    ReliabilityRuleReviewer, SecurityInvestigatorAgent, SecurityRuleReviewer,
 )
+from .auditor_agent import AuditorReviewAgent
+from .cross_shard_tracer_agent import CrossShardTracerReviewAgent
+from .verifier_agent import VerifierReviewAgent
 from .diff_parser import parse_unified_diff
 from .skills import SkillRegistry
 from .skill_evolution import DeclarativeSkillReviewer, SkillEvolutionEngine
@@ -32,14 +39,25 @@ class ReviewService:
     def __init__(self, settings: Settings):
         self.settings = settings
         settings.validate_evolution()
-        self.llm_config = settings.resolved_llm()
+        self.review_timeout_seconds = max(
+            settings.timeout_seconds, settings.agent_runtime_timeout_seconds,
+        )
+        self.llm_config = {} if settings.llm_mode == "disabled" else settings.resolved_llm()
+        self.llm_fallback_config = (
+            {} if settings.llm_mode == "disabled" or not self.llm_config
+            else settings.resolved_llm_fallback()
+        )
+        if settings.llm_mode == "required" and not self.llm_config:
+            raise ValueError("EVOAGENT_LLM_MODE=required needs a configured LLM provider")
         self.store = create_store(settings.database_url, settings.db_path)
         self.context_manager = ContextManager(
-            settings.context_max_tokens, settings.context_reserved_tokens
+            settings.context_max_tokens, settings.context_reserved_tokens,
+            soft_compact_ratio=settings.context_soft_compact_ratio,
+            hard_compact_ratio=settings.context_hard_compact_ratio,
         )
         self.memory = MemoryManager(
             self.store, settings.memory_enabled, settings.memory_recall_limit,
-            settings.memory_working_ttl_seconds,
+            settings.memory_working_ttl_seconds, settings.memory_promotion_support_threshold,
         )
         self.observability = Observability(settings.otel_service_name, settings.otel_endpoint)
         self.registry = SkillRegistry(
@@ -49,11 +67,16 @@ class ReviewService:
         )
         self.registry.register(
             "security-review", SecurityRuleReviewer(),
-            "1.0.0", "Security, injection and secret detection",
+            SecurityRuleReviewer.RULESET_REVISION, "Security, injection and secret detection",
         )
         self.registry.register(
             "reliability-review", ReliabilityRuleReviewer(),
-            "1.0.0", "Reliability and observability review",
+            ReliabilityRuleReviewer.RULESET_REVISION, "Reliability and observability review",
+        )
+        self.registry.register(
+            "context-security-reliability-review", ContextRuleReviewer(),
+            ContextRuleReviewer.RULESET_REVISION,
+            "Context-sensitive security and reliability review",
         )
         if self.llm_config:
             active = self.store.get_active_skill_version("llm-review")
@@ -66,7 +89,7 @@ class ReviewService:
         coordinator = self._build_coordinator(self.registry.reviewers())
         self.reviewer = coordinator
         self.harness = ReviewHarness(
-            self.store, self.reviewer, settings.max_steps, settings.timeout_seconds,
+            self.store, self.reviewer, settings.max_steps, self.review_timeout_seconds,
             observability=self.observability,
         )
         self.github = GitHubClient(settings.github_token)
@@ -100,7 +123,7 @@ class ReviewService:
             max_metric_regression=settings.eval_max_metric_regression,
         )
         self.queue = TaskQueue(
-            self._process_queued, settings.async_workers, settings.redis_url,
+            self._process_queued, settings.async_workers, settings.rocketmq_nameserver,
             settings.queue_max_attempts, settings.queue_lease_seconds,
             self._on_dead_letter,
         )
@@ -108,17 +131,49 @@ class ReviewService:
     def _build_llm_reviewer(self, prompt: str = "") -> OpenAICompatibleReviewer:
         if not self.llm_config:
             raise RuntimeError("no LLM provider is configured")
-        return OpenAICompatibleReviewer(
+        return PrimaryReviewAgent(
             str(self.llm_config["base_url"]),
             str(self.llm_config["api_key"]),
             str(self.llm_config["model"]),
-            self.settings.timeout_seconds,
+            self.settings.llm_request_timeout_seconds,
             system_prompt=prompt,
             provider=str(self.llm_config["provider"]),
             extra_headers=dict(self.llm_config.get("headers") or {}),
+            fallback=self.llm_fallback_config,
         )
 
     def _build_coordinator(self, reviewers: list) -> MultiAgentCoordinator:
+        def snapshot_factory(repository, pull_request, pr_map, _task_id):
+            # Direct API-submitted diffs have no trustworthy PR ref. In that case
+            # tools remain explicitly unavailable rather than reading the host.
+            if not repository or pull_request is None or not self.settings.github_token:
+                return None
+            try:
+                head = self.github.get_pull_request_head(repository, int(pull_request))
+                return GitHubSnapshotProvider(
+                    self.github, repository, head, [item.path for item in pr_map.files],
+                    allow_related=True,
+                ) if head else None
+            except Exception:
+                return None
+        effective_mode = self.settings.review_mode if self.llm_config else "rules_only"
+        if effective_mode == "adaptive_multi_agent" and self.llm_config:
+            args = (
+                str(self.llm_config["base_url"]), str(self.llm_config["api_key"]),
+                str(self.llm_config["model"]), self.settings.llm_request_timeout_seconds,
+            )
+            common = {
+                "provider": str(self.llm_config["provider"]),
+                "extra_headers": dict(self.llm_config.get("headers") or {}),
+                "fallback": self.llm_fallback_config,
+            }
+            reviewers = list(reviewers) + [
+                SecurityInvestigatorAgent(*args, **common),
+                ReliabilityImpactAgent(*args, **common),
+                CrossShardTracerReviewAgent(*args, **common),
+                VerifierReviewAgent(*args, **common),
+                AuditorReviewAgent(*args, **common),
+            ]
         return MultiAgentCoordinator(
             reviewers, max_workers=self.settings.agent_max_workers, store=self.store,
             agent_retries=self.settings.agent_retries,
@@ -126,6 +181,29 @@ class ReviewService:
             context_manager=self.context_manager, memory_manager=self.memory,
             agent_loop_max_steps=self.settings.agent_loop_max_steps,
             agent_loop_timeout_seconds=self.settings.agent_loop_timeout_seconds,
+            agent_runtime_max_steps=self.settings.agent_runtime_max_steps,
+            agent_runtime_timeout_seconds=self.settings.agent_runtime_timeout_seconds,
+            context_active_rounds=self.settings.context_active_rounds,
+            context_soft_compact_ratio=self.settings.context_soft_compact_ratio,
+            context_hard_compact_ratio=self.settings.context_hard_compact_ratio,
+            context_architecture=self.settings.context_architecture,
+            specialist_activation=self.settings.context_specialist_activation,
+            shard_file_threshold=self.settings.context_shard_file_threshold,
+            shard_changed_line_threshold=self.settings.context_shard_changed_line_threshold,
+            snapshot_factory=snapshot_factory,
+            review_mode=effective_mode,
+            review_pipeline=self.settings.review_pipeline,
+            challenge_strategy=(
+                "independent_auditor" if effective_mode == "adaptive_multi_agent"
+                else "self_reflect"
+            ),
+            agent_budget={
+                "max_agent_runs": self.settings.agent_budget_max_runs,
+                "max_llm_calls": self.settings.agent_budget_max_llm_calls,
+                "max_tool_calls": self.settings.agent_budget_max_tool_calls,
+                "max_input_tokens": self.settings.agent_budget_max_input_tokens,
+                "max_output_tokens": self.settings.agent_budget_max_output_tokens,
+            },
         )
 
     def _candidate_reviewer(self, tenant_id: str):
@@ -143,11 +221,13 @@ class ReviewService:
 
     def _run_review(
         self, task_id: str, repository: str, pull_request: Optional[int],
-        diff: str, tenant_id: str,
+        diff: str, tenant_id: str, run_token: str = "",
+        claim_token: str = "",
     ):
         task = self.store.get(task_id, tenant_id) or {}
         deployment = self.store.get_deployment(tenant_id, "llm-review")
         evolved = self._active_evolved_reviewers(tenant_id)
+        runtime_fingerprint = self._runtime_fingerprint(tenant_id, task.get("input") or {})
         if (
             (task.get("input") or {}).get("release_lane") == "canary"
             or (deployment and deployment.get("status") == "promoted")
@@ -160,7 +240,9 @@ class ReviewService:
                 ] + evolved + [candidate])
                 harness = ReviewHarness(
                     self.store, canary_reviewer, self.settings.max_steps,
-                    self.settings.timeout_seconds, observability=self.observability,
+                    self.review_timeout_seconds, observability=self.observability,
+                    runtime_fingerprint=runtime_fingerprint, run_token=run_token,
+                    claim_token=claim_token,
                 )
                 return harness.run(task_id, repository, pull_request, diff, tenant_id)
         if evolved:
@@ -169,10 +251,73 @@ class ReviewService:
             )
             harness = ReviewHarness(
                 self.store, tenant_reviewer, self.settings.max_steps,
-                self.settings.timeout_seconds, observability=self.observability,
+                self.review_timeout_seconds, observability=self.observability,
+                runtime_fingerprint=runtime_fingerprint, run_token=run_token,
+                claim_token=claim_token,
             )
             return harness.run(task_id, repository, pull_request, diff, tenant_id)
-        return self.harness.run(task_id, repository, pull_request, diff, tenant_id)
+        harness = ReviewHarness(
+            self.store, self.reviewer, self.settings.max_steps, self.review_timeout_seconds,
+            observability=self.observability, runtime_fingerprint=runtime_fingerprint,
+            run_token=run_token, claim_token=claim_token,
+        )
+        return harness.run(task_id, repository, pull_request, diff, tenant_id)
+
+    def _runtime_fingerprint(self, tenant_id: str, task_input: Dict[str, Any]) -> str:
+        def source_hash(source: str) -> str:
+            try:
+                with open(source, "rb") as handle:
+                    return hashlib.sha256(handle.read()).hexdigest()
+            except OSError:
+                return ""
+
+        skills = []
+        for skill in self.registry.list():
+            skills.append({
+                "name": skill["name"], "version": skill["version"],
+                "source": skill["source"], "source_sha256": source_hash(skill["source"]),
+            })
+        active_prompt = self.store.get_active_skill_version("llm-review")
+        evolved = self.store.list_active_skill_artifacts(tenant_id)
+        deployment = self.store.get_deployment(tenant_id, "llm-review") or {}
+        use_candidate = (
+            task_input.get("release_lane") == "canary"
+            or deployment.get("status") == "promoted"
+        )
+        candidate = None
+        if use_candidate and deployment.get("candidate_version") is not None:
+            candidate = next((
+                item for item in self.store.list_skill_versions("llm-review")
+                if int(item["version"]) == int(deployment["candidate_version"])
+            ), None)
+        snapshot = {
+            "llm": {
+                "provider": self.llm_config.get("provider", ""),
+                "base_url": self.llm_config.get("base_url", ""),
+                "model": self.llm_config.get("model", ""),
+            },
+            "skills": sorted(skills, key=lambda item: item["name"]),
+            "prompt": {
+                "version": candidate["version"] if candidate else (
+                    active_prompt["version"] if active_prompt else None
+                ),
+                "sha256": hashlib.sha256((candidate or active_prompt or {}).get(
+                    "prompt", ""
+                ).encode("utf-8")).hexdigest(),
+            },
+            "evolved": sorted([
+                {"name": item["skill_name"], "version": item["version"],
+                 "sha256": item["artifact_sha256"]}
+                for item in evolved
+            ], key=lambda item: item["name"]),
+            "builtin_rule_revisions": {
+                "local": LocalRuleReviewer.RULESET_REVISION,
+                "security": SecurityRuleReviewer.RULESET_REVISION,
+                "reliability": ReliabilityRuleReviewer.RULESET_REVISION,
+            },
+        }
+        encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _run_shadow(
         self, task_id: str, tenant_id: str, diff: str, primary_report,
@@ -234,7 +379,7 @@ class ReviewService:
         skills = self.registry.list()
         self.reviewer = self._build_coordinator(self.registry.reviewers())
         self.harness = ReviewHarness(
-            self.store, self.reviewer, self.settings.max_steps, self.settings.timeout_seconds,
+            self.store, self.reviewer, self.settings.max_steps, self.review_timeout_seconds,
             observability=self.observability,
         )
         return skills
@@ -330,36 +475,57 @@ class ReviewService:
         self._validate_review(repository, diff)
         self._authorize_repository(tenant_id, repository)
         task_id = self._create_task(repository, diff, pull_request, source, tenant_id)
+        run_token = self.store.issue_run_token(task_id)
         self.queue.submit({
             "task_id": task_id, "repository": repository, "pull_request": pull_request,
             "github_issue_url": github_issue_url, "installation_id": installation_id,
-            "tenant_id": tenant_id,
+            "tenant_id": tenant_id, "run_token": run_token,
         }, message_id=task_id)
         metrics.inc("reviews_enqueued_total")
         return {"task_id": task_id, "state": "PENDING", "queue": self.queue.backend}
 
     def _process_queued(self, payload: Dict[str, Any]) -> None:
         task_id = payload["task_id"]
+        run_token = str(payload.get("run_token") or "")
+        claim_token = uuid.uuid4().hex if run_token else ""
+        if run_token and not self.store.claim_run(
+            task_id, run_token, claim_token, self.settings.queue_lease_seconds,
+        ):
+            return
         task = self.store.get(task_id)
         if not task:
+            if run_token:
+                self.store.release_run(task_id, run_token, claim_token)
             raise PermanentTaskError("task record no longer exists")
         tenant_id = payload.get("tenant_id") or task.get("tenant_id") or "default"
         diff = self.store.get_task_payload(task_id)
-        if diff is None and payload.get("diff_url"):
-            client = (
-                self.github_client_for_installation(payload.get("installation_id"))
-                if payload.get("installation_id") else self.github
-            )
-            client.ensure_repository_access(payload["repository"])
-            diff = client.fetch_diff(payload["diff_url"])
-            self._validate_review(payload["repository"], diff)
-            encoded = diff.encode("utf-8")
-            self.store.save_task_payload(task_id, diff)
-            self.store.update_task_input(task_id, {
-                "diff_pending": False, "diff_bytes": len(encoded),
-                "diff_sha256": hashlib.sha256(encoded).hexdigest(),
-            })
+        try:
+            if diff is None and payload.get("diff_url"):
+                client = (
+                    self.github_client_for_installation(payload.get("installation_id"))
+                    if payload.get("installation_id") else self.github
+                )
+                client.ensure_repository_access(payload["repository"])
+                if payload.get("repository") and isinstance(payload.get("pull_request"), int):
+                    diff = client.fetch_pull_request_diff(
+                        payload["repository"], payload["pull_request"]
+                    )
+                else:
+                    diff = client.fetch_diff(payload["diff_url"])
+                self._validate_review(payload["repository"], diff)
+                encoded = diff.encode("utf-8")
+                self.store.save_task_payload(task_id, diff)
+                self.store.update_task_input(task_id, {
+                    "diff_pending": False, "diff_bytes": len(encoded),
+                    "diff_sha256": hashlib.sha256(encoded).hexdigest(),
+                })
+        except Exception:
+            if run_token:
+                self.store.release_run(task_id, run_token, claim_token)
+            raise
         if diff is None:
+            if run_token:
+                self.store.release_run(task_id, run_token, claim_token)
             raise PermanentTaskError("task payload no longer exists")
         try:
             with self.observability.span(
@@ -367,7 +533,7 @@ class ReviewService:
             ), metrics.timer("review_duration"):
                 report = self._run_review(
                     task_id, payload["repository"], payload.get("pull_request"), diff,
-                    tenant_id,
+                    tenant_id, run_token, claim_token,
                 )
             self._run_shadow(task_id, tenant_id, diff, report)
             metrics.inc("reviews_total")
@@ -379,16 +545,23 @@ class ReviewService:
                     payload["github_issue_url"], to_markdown(report.to_dict()),
                     "<!-- evoagent-review:%s -->" % task_id,
                 )
+        except TaskStale:
+            return
         except Exception:
             metrics.inc("reviews_failed_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")
             self.releases.observe(tenant_id, "llm-review", True, lane)
             self.alerts.evaluate(tenant_id)
             raise
+        finally:
+            if run_token:
+                self.store.release_run(task_id, run_token, claim_token)
 
     def _on_dead_letter(self, payload: Dict[str, Any], error: str) -> None:
         task_id = payload.get("task_id", "")
         tenant_id = payload.get("tenant_id", "default")
+        if task_id:
+            self.store.record_dead_letter(task_id, payload, error)
         task = self.store.get(task_id, tenant_id) if task_id else None
         if task and task.get("state") not in {
             TaskState.SUCCESS.value, TaskState.FAILED.value, TaskState.CANCELLED.value,
@@ -408,6 +581,17 @@ class ReviewService:
             "Task %s entered the dead-letter queue: %s" % (task_id, error),
         )
         metrics.inc("dead_letters_total")
+
+    def dead_letters(self, limit: int = 100) -> list:
+        return self.store.list_dead_letters(limit)
+
+    def replay_dead_letter(self, message_id: str) -> bool:
+        item = self.store.get_dead_letter(message_id)
+        if not item:
+            return False
+        self.queue.submit(item["payload"], message_id=message_id)
+        self.store.remove_dead_letter(message_id)
+        return True
 
     def handle_github_pull_request(
         self, payload: Dict[str, Any], delivery_id: str,
@@ -440,11 +624,12 @@ class ReviewService:
             repository, number, "github-webhook", tenant_id,
             {"diff_url": diff_url},
         )
+        run_token = self.store.issue_run_token(task_id)
         self.queue.submit({
             "task_id": task_id, "repository": repository, "pull_request": number,
             "github_issue_url": pull.get("issue_url", ""),
             "installation_id": installation_id, "tenant_id": tenant_id,
-            "diff_url": diff_url,
+            "diff_url": diff_url, "run_token": run_token,
         }, message_id=task_id)
         metrics.inc("reviews_enqueued_total")
         result = {"task_id": task_id, "state": "PENDING", "queue": self.queue.backend}
@@ -493,9 +678,13 @@ class ReviewService:
         if category not in {"false_positive", "missed_issue", "bad_fix", "accepted"}:
             raise ValueError("unsupported feedback category")
         self.store.record_failure_case(task_id, category, {"finding": finding, "note": note[:2000]})
+        feedback_finding = dict(finding or {})
+        feedback_finding.setdefault("pr_number", task.get("pull_request"))
+        payload = self.store.get_task_payload(task_id) or ""
         self.memory.remember_feedback(
             task.get("tenant_id") or tenant_id or "default", task["repository"],
-            task_id, category, finding, note[:2000],
+            task_id, category, feedback_finding, note[:2000],
+            "diff:" + hashlib.sha256(payload.encode("utf-8")).hexdigest() if payload else "",
         )
         metrics.inc("feedback_total")
         return {"recorded": True, "category": category}
@@ -509,10 +698,11 @@ class ReviewService:
         diff = self.store.get_task_payload(task_id)
         if diff is None:
             raise ValueError("task payload is no longer available")
+        run_token = self.store.issue_run_token(task_id)
         self.queue.submit({
             "task_id": task_id, "repository": task["repository"],
             "pull_request": task.get("pull_request"),
-            "tenant_id": task.get("tenant_id", "default"),
+            "tenant_id": task.get("tenant_id", "default"), "run_token": run_token,
         }, message_id=task_id)
         return {"task_id": task_id, "state": "PENDING", "resumed": True}
 

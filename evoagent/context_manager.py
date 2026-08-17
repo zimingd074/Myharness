@@ -5,6 +5,8 @@ import json
 import re
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+from .context.budget import ContextBudget, TokenCounter, Utf8TokenCounter
+
 
 RISK_TERMS = {
     "eval", "exec", "shell", "subprocess", "password", "secret", "token",
@@ -23,6 +25,8 @@ class ContextBundle:
     omitted_hunks: int = 0
     strategy: str = "full-diff"
     source_sha256: str = ""
+    omitted_added_lines: int = 0
+    omitted_context_lines: int = 0
 
     def metadata(self) -> Dict[str, Any]:
         value = asdict(self)
@@ -44,6 +48,7 @@ class ManagedContext:
     dropped_feedback: int = 0
     dropped_memories: int = 0
     dropped_observations: int = 0
+    budget: Dict[str, int] = field(default_factory=dict)
 
     def metadata(self) -> Dict[str, Any]:
         value = asdict(self)
@@ -63,18 +68,25 @@ class _Hunk:
 class ContextManager:
     """Build a bounded LLM context while preserving changed-line evidence."""
 
-    def __init__(self, max_tokens: int = 12000, reserved_tokens: int = 2500):
+    def __init__(
+        self, max_tokens: int = 12000, reserved_tokens: int = 2500,
+        token_counter: TokenCounter = None, soft_compact_ratio: float = .60,
+        hard_compact_ratio: float = .80,
+    ):
         if max_tokens < 512:
             raise ValueError("context max_tokens must be at least 512")
         if reserved_tokens < 0 or reserved_tokens >= max_tokens:
             raise ValueError("context reserved_tokens must be within the context budget")
         self.max_tokens = max_tokens
         self.reserved_tokens = reserved_tokens
+        self.token_counter = token_counter or Utf8TokenCounter()
+        self.budget = ContextBudget(
+            max_tokens, reserved_tokens, soft_compact_ratio, hard_compact_ratio,
+        )
 
-    @staticmethod
-    def estimate_tokens(text: str) -> int:
+    def estimate_tokens(self, text: str) -> int:
         # A conservative dependency-free estimate for mixed source code and text.
-        return max(1, (len(text.encode("utf-8")) + 3) // 4)
+        return self.token_counter.count(text)
 
     def build(
         self, diff: str, assignment: Dict[str, Any] = None,
@@ -137,11 +149,25 @@ class ContextManager:
         all_paths = list(file_headers)
         omitted_files = [path for path in all_paths if path not in included_headers]
         omitted_hunks = max(0, len(hunks) - len(selected))
+        selected_text = "\n".join(item.text for item in selected)
+        omitted_added_lines = max(0, sum(
+            1 for line in diff.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ) - sum(
+            1 for line in selected_text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ))
+        omitted_context_lines = max(0, sum(
+            1 for line in diff.splitlines()
+            if line.startswith(" ")
+        ) - sum(1 for line in selected_text.splitlines() if line.startswith(" ")))
         final_tokens = self.estimate_tokens(compressed)
         return ContextBundle(
             compressed, True, original_tokens, final_tokens,
             omitted_files=omitted_files, omitted_hunks=omitted_hunks,
             strategy="risk-ranked-hunk-compression", source_sha256=digest,
+            omitted_added_lines=omitted_added_lines,
+            omitted_context_lines=omitted_context_lines,
         )
 
     def compose(
@@ -150,6 +176,9 @@ class ContextManager:
         memories: Sequence[Dict[str, Any]] = (),
         observations: Sequence[Dict[str, Any]] = (),
         tools: Sequence[Dict[str, Any]] = (),
+        loop_context: Dict[str, Any] = None,
+        frozen_context: Dict[str, Any] = None,
+        retrieved_context: Sequence[Dict[str, Any]] = (),
     ) -> ManagedContext:
         """Fit all changing loop state into one deterministic token budget.
 
@@ -158,12 +187,16 @@ class ContextManager:
         portion. Lower-priority records are dropped instead of silently growing
         the model request on every loop iteration.
         """
-        runtime_bytes = max(128, self.reserved_tokens * 4)
+        # A small shard releases unused diff capacity to runtime.  This keeps
+        # the legacy 9500/2500 default as the minimum guarantee, not a wall.
+        allocations = self.budget.allocations(diff_bundle.final_tokens)
+        runtime_bytes = max(128, allocations["runtime"] * 4)
         parts: List[str] = []
         used = 0
         was_truncated = False
 
-        def append(label: str, value: Any, optional: bool = False) -> bool:
+        section_used: Dict[str, int] = {}
+        def append(label: str, value: Any, optional: bool = False, section: str = "shared") -> bool:
             nonlocal used, was_truncated
             rendered = value if isinstance(value, str) else json.dumps(
                 value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -171,9 +204,13 @@ class ContextManager:
             line = "%s: %s\n" % (label, rendered.replace("\x00", ""))
             encoded = line.encode("utf-8")
             remaining = runtime_bytes - used
+            section_limit = (allocations.get(section, 0) + allocations.get("shared", 0)) * 4
+            if section != "shared":
+                remaining = min(remaining, max(0, section_limit - section_used.get(section, 0)))
             if len(encoded) <= remaining:
                 parts.append(line)
                 used += len(encoded)
+                section_used[section] = section_used.get(section, 0) + len(encoded)
                 return True
             if optional or remaining < 48:
                 was_truncated = True
@@ -182,15 +219,19 @@ class ContextManager:
             if clipped:
                 parts.append(clipped.decode("utf-8", errors="ignore") + "\n")
                 used += len(clipped) + 1
+                section_used[section] = section_used.get(section, 0) + len(clipped) + 1
             was_truncated = True
             return bool(clipped)
 
         compact_assignment = {
             key: assignment.get(key) for key in (
-                "agent", "objective", "files", "risk_domains", "round", "reason"
+                "agent", "objective", "files", "risk_domains", "round", "reason",
+                "shard_id", "shard_files", "coverage_scope", "pr_map",
             ) if assignment.get(key) not in (None, "", [])
         }
-        append("ASSIGNMENT", compact_assignment)
+        frozen = dict(frozen_context or {})
+        frozen.setdefault("assignment", compact_assignment)
+        append("FROZEN_CONTEXT", frozen, section="frozen")
         for tool in tools:
             append("TOOL", {
                 "name": tool.get("name"),
@@ -207,14 +248,27 @@ class ContextManager:
                 "senders": sorted({str(item.get("sender", "")) for item in inbox}),
             }, optional=True)
 
+        loop_state = dict(loop_context or {})
+        active_rounds = list(loop_state.get("active_rounds") or [])
+        compressed_history = loop_state.get("compressed_history") or {}
+        pinned_evidence = loop_state.get("pinned_evidence") or []
         kept_observations = 0
-        for item in reversed(observations):
-            compact = {
-                key: item.get(key) for key in ("step", "tool", "ok", "result", "error")
-                if item.get(key) is not None
-            }
-            if append("OBSERVATION", compact, optional=True):
+        for item in active_rounds:
+            if append("ACTIVE_ROUND", item, optional=True, section="active"):
                 kept_observations += 1
+        if compressed_history:
+            append("COMPRESSED_HISTORY", compressed_history, optional=True, section="compressed")
+        if pinned_evidence:
+            append("PINNED_EVIDENCE", pinned_evidence, optional=True, section="frozen")
+        # Compatibility path for callers which do not yet supply LoopContext.
+        if not loop_context:
+            for item in reversed(observations):
+                compact = {key: item.get(key) for key in ("step", "tool", "ok", "result", "error")
+                           if item.get(key) is not None}
+                if append("OBSERVATION", compact, optional=True):
+                    kept_observations += 1
+        for item in retrieved_context:
+            append("RETRIEVED_CONTEXT", item, optional=True, section="retrieved")
 
         kept_feedback = 0
         for item in feedback:
@@ -252,6 +306,7 @@ class ContextManager:
             dropped_feedback=max(0, len(feedback) - kept_feedback),
             dropped_memories=max(0, len(memories) - kept_memories),
             dropped_observations=max(0, len(observations) - kept_observations),
+            budget={name: value for name, value in allocations.items()},
         )
 
     @staticmethod
@@ -365,7 +420,7 @@ class ContextManager:
         used = 0
         for index in sorted(selected):
             if index - previous > 1 and output:
-                marker = " ... [unchanged context omitted by EvoAgent] ...\n"
+                marker = " ... [lower-priority diff content omitted; changed lines may be included] ...\n"
                 if used + len(marker.encode("utf-8")) <= byte_budget:
                     output.append(marker)
                     used += len(marker.encode("utf-8"))
@@ -375,6 +430,10 @@ class ContextManager:
             output.append(lines[index])
             used += len(encoded)
             previous = index
+        if selected and max(selected) < len(lines) - 1:
+            marker = " ... [lower-priority diff content omitted; changed lines may be included] ...\n"
+            if used + len(marker.encode("utf-8")) <= byte_budget:
+                output.append(marker)
         return "".join(output)
 
 
@@ -383,8 +442,10 @@ def render_memories(memories: Iterable[Dict[str, Any]], max_chars: int = 5000) -
     lines = []
     used = 0
     for item in memories:
-        line = "[%s/%s] %s" % (
-            item.get("scope", "memory"), item.get("kind", "note"),
+        status = (item.get("metadata") or {}).get("status", "")
+        state = " status=%s" % status if status and status != "active" else ""
+        line = "[%s/%s%s] %s" % (
+            item.get("scope", "memory"), item.get("kind", "note"), state,
             str(item.get("content", "")).replace("\n", " ")[:1000],
         )
         if used + len(line) + 1 > max_chars:

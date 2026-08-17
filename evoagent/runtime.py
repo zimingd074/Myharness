@@ -17,6 +17,10 @@ import json
 import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from .context.loop_context import LoopContext
+from .context.reducers import reduce_tool_result
+from .context.budget import ContextBudget
+
 
 class RuntimeBudgetExceeded(RuntimeError):
     """The configured step or wall-clock budget was exhausted."""
@@ -24,6 +28,10 @@ class RuntimeBudgetExceeded(RuntimeError):
 
 class RuntimeCancelled(RuntimeError):
     """The owning task requested cancellation."""
+
+
+class RuntimeStaleRun(RuntimeError):
+    """A queued worker lost ownership of the task execution token."""
 
 
 class AgentLoopProtocolError(RuntimeError):
@@ -36,6 +44,7 @@ class AgentTool:
     description: str
     parameters: Dict[str, Any]
     handler: Callable[..., Any]
+    reducer: Optional[Callable[[Any, int], str]] = None
 
     def catalog_entry(self) -> Dict[str, Any]:
         return {
@@ -144,10 +153,15 @@ class AgentRuntime:
     def execute(
         self, initial_state: Dict[str, Any], nodes: Iterable[RuntimeNode],
         task_id: str = "", checkpoint_store=None,
+        checkpoint_fingerprints: Optional[Mapping[str, str]] = None,
+        run_token: str = "",
+        claim_token: str = "",
         cancel_check: Optional[Callable[[], bool]] = None,
         event_sink: Optional[Callable[[RuntimeEvent], None]] = None,
         span_factory: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
-        non_retryable: Tuple[type, ...] = (ValueError, RuntimeCancelled, RuntimeBudgetExceeded),
+        non_retryable: Tuple[type, ...] = (
+            ValueError, RuntimeCancelled, RuntimeBudgetExceeded, RuntimeStaleRun,
+        ),
     ) -> Dict[str, Any]:
         state = dict(initial_state)
         started = time.monotonic()
@@ -156,6 +170,7 @@ class AgentRuntime:
             checkpoint_store.load_checkpoints(task_id)
             if checkpoint_store is not None and task_id else {}
         )
+        checkpoint_fingerprints = dict(checkpoint_fingerprints or {})
 
         def emit(kind: str, node: str, attempt: int = 0, **detail) -> None:
             if event_sink:
@@ -171,11 +186,20 @@ class AgentRuntime:
 
         for node in nodes:
             cached = checkpoints.get(node.name) if node.checkpoint else None
-            if cached and cached.get("status") == "completed":
+            has_fingerprint = node.name in checkpoint_fingerprints
+            fingerprint = checkpoint_fingerprints.get(node.name, "")
+            if cached and cached.get("status") == "completed" and (
+                not has_fingerprint or (
+                    fingerprint and cached.get("fingerprint") == fingerprint
+                )
+            ):
                 output = dict(cached.get("state") or {})
                 state.update(output)
                 emit("checkpoint_restored", node.name, int(cached.get("attempt", 0)))
                 continue
+            if (cached and cached.get("status") == "completed" and node.checkpoint
+                    and has_fingerprint):
+                emit("checkpoint_invalidated", node.name, int(cached.get("attempt", 0)))
 
             retries = self.node_retries if node.retries is None else node.retries
             previous_attempt = int((cached or {}).get("attempt", 0))
@@ -200,9 +224,13 @@ class AgentRuntime:
                         raise TypeError("runtime node %s must return a dict" % node.name)
                     state.update(output)
                     if checkpoint_store is not None and task_id and node.checkpoint:
-                        checkpoint_store.save_checkpoint(
-                            task_id, node.name, output, "completed", attempt
+                        saved = checkpoint_store.save_checkpoint(
+                            task_id, node.name, output, "completed", attempt,
+                            fingerprint=fingerprint, run_token=run_token,
+                            claim_token=claim_token,
                         )
+                        if saved is False:
+                            raise RuntimeStaleRun("task execution was superseded")
                     emit("node_completed", node.name, attempt, output_keys=sorted(output))
                     last_error = None
                     break
@@ -211,9 +239,13 @@ class AgentRuntime:
                 except Exception as exc:
                     last_error = exc
                     if checkpoint_store is not None and task_id and node.checkpoint:
-                        checkpoint_store.save_checkpoint(
-                            task_id, node.name, {}, "failed", attempt, str(exc)
+                        saved = checkpoint_store.save_checkpoint(
+                            task_id, node.name, {}, "failed", attempt, str(exc),
+                            fingerprint=fingerprint, run_token=run_token,
+                            claim_token=claim_token,
                         )
+                        if saved is False:
+                            raise RuntimeStaleRun("task execution was superseded")
                     emit(
                         "node_failed", node.name, attempt,
                         error=str(exc)[:1000], will_retry=offset <= retries,
@@ -229,6 +261,8 @@ class AgentLoopResult:
     steps: int
     observations: List[Dict[str, Any]]
     stop_reason: str
+    loop_context: Dict[str, Any] = field(default_factory=dict)
+    usage: Dict[str, Any] = field(default_factory=dict)
 
 
 class AgentLoop:
@@ -236,7 +270,9 @@ class AgentLoop:
 
     def __init__(
         self, max_steps: int = 4, timeout_seconds: int = 45,
-        max_observation_chars: int = 4000,
+        max_observation_chars: int = 4000, active_rounds: int = 3,
+        soft_compact_ratio: float = .60, hard_compact_ratio: float = .80,
+        context_budget: Optional[ContextBudget] = None,
     ):
         if max_steps < 1:
             raise ValueError("agent loop max_steps must be at least 1")
@@ -245,6 +281,27 @@ class AgentLoop:
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
         self.max_observation_chars = max(256, max_observation_chars)
+        self.active_rounds = max(1, active_rounds)
+        self.soft_compact_ratio = soft_compact_ratio
+        self.hard_compact_ratio = hard_compact_ratio
+        self.context_budget = context_budget
+
+    @staticmethod
+    def _locator_metadata(value: Any) -> Dict[str, Any]:
+        """Retain bounded provenance fields without duplicating raw tool output."""
+        if not isinstance(value, dict):
+            return {}
+        result = {}
+        for key in ("path", "line", "start_line", "end_line", "symbol", "kind"):
+            if value.get(key) is not None:
+                result[key] = value[key]
+        hits = value.get("hits")
+        if isinstance(hits, list):
+            result["locations"] = [
+                {key: item[key] for key in ("path", "line", "kind") if key in item}
+                for item in hits[:20] if isinstance(item, dict)
+            ]
+        return result
 
     def run(
         self, stepper: Callable[[Dict[str, Any]], Dict[str, Any]],
@@ -253,7 +310,12 @@ class AgentLoop:
     ) -> AgentLoopResult:
         state = dict(initial_state)
         observations = list(state.get("observations") or [])
+        loop_context = LoopContext(self.active_rounds, self.soft_compact_ratio, self.hard_compact_ratio)
         started = time.monotonic()
+        usage = {
+            "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+            "llm_calls": 0, "usage_source": "provider",
+        }
 
         def emit(kind: str, **detail) -> None:
             if event_sink:
@@ -265,15 +327,35 @@ class AgentLoop:
                 raise RuntimeBudgetExceeded("agent loop time budget exceeded")
             state["loop_step"] = step
             state["observations"] = list(observations)
+            state["loop_context"] = loop_context.render()
             action = stepper(state)
             if not isinstance(action, dict):
                 raise AgentLoopProtocolError("agent loop action must be an object")
             kind = str(action.get("action", "")).strip().lower()
+            action_usage = dict(action.get("_usage") or {})
+            usage["llm_calls"] += 1
+            for field in ("input_tokens", "output_tokens", "cached_tokens"):
+                usage[field] += int(action_usage.get(field, 0) or 0)
+            if action_usage.get("usage_source") != "provider":
+                usage["usage_source"] = "estimated"
             emit("agent_loop_action", step=step, action=kind)
             if kind == "final":
+                output = action.get("findings", action.get("output"))
+                for finding in list(output or []):
+                    finding_id = str(getattr(finding, "rule_id", "finding"))
+                    explicit_refs = list(getattr(finding, "evidence_refs", []) or [])
+                    if explicit_refs:
+                        loop_context.pin(explicit_refs, finding_id)
+                    else:
+                        # A model that did not return an ID may only fall back
+                        # to an exact changed-line locator, never "latest".
+                        loop_context.pin_finding(
+                            finding_id, str(getattr(finding, "path", "")),
+                            int(getattr(finding, "line", 0) or 0),
+                        )
                 return AgentLoopResult(
-                    action.get("findings", action.get("output")), step,
-                    observations, "final",
+                    output, step,
+                    observations, "final", loop_context.render(), usage,
                 )
             if kind != "tool":
                 raise AgentLoopProtocolError("unsupported agent loop action: %s" % kind)
@@ -284,18 +366,22 @@ class AgentLoop:
             try:
                 if isinstance(tools, ToolRegistry):
                     value = tools.invoke(tool_name, arguments)
+                    tool_spec = tools._tools.get(tool_name)
                 else:
                     tool = tools.get(tool_name)
                     if tool is None:
                         raise AgentLoopProtocolError("unknown agent tool: %s" % tool_name)
                     value = tool(**arguments)
+                    tool_spec = None
                 rendered = (
-                    json.dumps(value, ensure_ascii=False, sort_keys=True)
-                    if isinstance(value, (dict, list, tuple)) else str(value)
+                    tool_spec.reducer(value, self.max_observation_chars)
+                    if tool_spec and tool_spec.reducer else
+                    reduce_tool_result(tool_name, value, self.max_observation_chars)
                 )
                 observation = {
                     "step": step, "tool": tool_name, "ok": True,
-                    "result": rendered[:self.max_observation_chars],
+                    "result": rendered,
+                    "locator": self._locator_metadata(value),
                 }
             except Exception as exc:
                 observation = {
@@ -303,6 +389,36 @@ class AgentLoop:
                     "error": str(exc)[:1000],
                 }
             observations.append(observation)
+            observation.update({
+                "shard_id": str(state.get("shard_identity", {}).get("id", "")),
+                "agent": str(state.get("assignment", {}).get("agent", "")),
+                "snapshot_id": str(state.get("snapshot_id", "")),
+                "producer_run_id": str(state.get("producer_run_id", "")),
+            })
+            loop_context.add_round(step, action, observation)
+            evidence_refs = action.get("evidence_refs") or []
+            if isinstance(evidence_refs, list):
+                loop_context.pin(evidence_refs)
+            context_tokens = int(action.get("_context_tokens", 0) or 0)
+            context_max_tokens = max(1, int(action.get("_context_max_tokens", 0) or 1))
+            # ContextBudget is the single threshold authority.  A supplied
+            # manager budget preserves its configured 60%/80% policy; a loop
+            # used stand-alone gets an equivalent local policy.
+            budget = self.context_budget or ContextBudget(
+                max_tokens=context_max_tokens,
+                soft_compact_ratio=self.soft_compact_ratio,
+                hard_compact_ratio=self.hard_compact_ratio,
+            )
+            if budget.max_tokens != context_max_tokens:
+                budget = ContextBudget(
+                    max_tokens=context_max_tokens,
+                    soft_compact_ratio=budget.soft_compact_ratio,
+                    hard_compact_ratio=budget.hard_compact_ratio,
+                )
+            over_soft = budget.should_compact(context_tokens)
+            over_hard = budget.should_compact(context_tokens, hard=True)
+            if len(observations) > loop_context.active_rounds or over_soft:
+                loop_context.compact(force=over_hard)
             emit("agent_loop_observation", **observation)
         emit("agent_loop_budget_exhausted", step=self.max_steps, budget="steps")
         raise RuntimeBudgetExceeded("agent loop step budget exceeded")

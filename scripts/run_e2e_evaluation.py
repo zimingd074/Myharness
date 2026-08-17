@@ -6,20 +6,28 @@ import sys
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPORT_DIR = os.path.join(ROOT, "tests", "evaluation_reports")
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from evoagent.evaluation_benchmark import (  # noqa: E402
-    baseline_reviewer,
-    candidate_reviewer,
+    ContextRuleReviewer,
     generate_controlled_pr_cases,
+)
+from evoagent.ab_report import (  # noqa: E402
+    build_ab_summary,
+    markdown_sections,
+    report_paths,
+    rule_catalog,
+    timestamped_run_directory,
 )
 from evoagent.evaluation_harness import (  # noqa: E402
     EndToEndEvaluationHarness,
-    FixtureRepairer,
     comparison_summary,
     load_jsonl,
 )
+from evoagent.full_chain_evaluation import QueuedServiceReviewer, build_service  # noqa: E402
+from evoagent.reviewer import LocalRuleReviewer  # noqa: E402
 
 
 def write_jsonl(path, cases):
@@ -33,7 +41,7 @@ def percent(value):
     return "%.1f%%" % (100 * value)
 
 
-def markdown_report(baseline, candidate, comparison):
+def markdown_report(baseline, candidate, comparison, ab_summary):
     b = baseline["metrics"]
     c = candidate["metrics"]
     dataset = candidate["dataset"]
@@ -129,6 +137,8 @@ def markdown_report(baseline, candidate, comparison):
     lines.extend([
         "",
     ])
+    lines.append("")
+    lines.extend(markdown_sections(ab_summary))
     return "\n".join(lines)
 
 
@@ -138,13 +148,26 @@ def main():
         "--dataset", default=os.path.join(ROOT, "evaluation_data", "pr_diff_100.jsonl")
     )
     parser.add_argument(
-        "--output-dir", default=os.path.join(ROOT, "output", "evaluation")
-    )
-    parser.add_argument(
         "--reuse-dataset", action="store_true",
         help="Load the existing JSONL instead of regenerating the controlled corpus.",
     )
+    parser.add_argument(
+        "--with-llm", action="store_true",
+        help="Add the configured OpenAI-compatible LLM reviewer to the candidate service.",
+    )
+    parser.add_argument(
+        "--llm-timeout-seconds", type=int, default=180,
+        help="Minimum model, agent-loop, and task timeout for --with-llm (default: 180).",
+    )
+    parser.add_argument(
+        "--parallelism", type=int, default=1,
+        help="Concurrent evaluation tasks; use 4 for the LLM candidate to reduce total runtime.",
+    )
     args = parser.parse_args()
+    if args.llm_timeout_seconds < 1:
+        parser.error("--llm-timeout-seconds must be positive")
+    if args.parallelism < 1:
+        parser.error("--parallelism must be positive")
 
     if args.reuse_dataset:
         cases = load_jsonl(args.dataset)
@@ -152,29 +175,73 @@ def main():
         cases = generate_controlled_pr_cases()
         write_jsonl(args.dataset, cases)
 
-    baseline = EndToEndEvaluationHarness().run(
-        baseline_reviewer(), cases, "single-agent-baseline"
+    run_dir = timestamped_run_directory(
+        REPORT_DIR,
+        "full-chain-multi-agent-context-rules-llm-%ss-%sw" % (
+            args.llm_timeout_seconds, args.parallelism,
+        )
+        if args.with_llm
+        else "full-chain-multi-agent-context-rules",
     )
-    candidate = EndToEndEvaluationHarness(repairer=FixtureRepairer()).run(
-        candidate_reviewer(), cases, "multi-agent-candidate"
+    baseline_reviewer = QueuedServiceReviewer(
+        build_service(
+            os.path.join(run_dir, "baseline-service.db"), baseline=True,
+            async_workers=args.parallelism,
+        ),
+        "queued-single-agent-baseline",
+        timeout_seconds=args.llm_timeout_seconds if args.with_llm else 30,
     )
+    candidate_reviewer = QueuedServiceReviewer(
+        build_service(
+            os.path.join(run_dir, "candidate-service.db"), with_llm=args.with_llm,
+            llm_timeout_seconds=args.llm_timeout_seconds, async_workers=args.parallelism,
+        ),
+        "queued-multi-agent-candidate",
+        timeout_seconds=args.llm_timeout_seconds if args.with_llm else 30,
+    )
+    try:
+        baseline = EndToEndEvaluationHarness().run(
+            baseline_reviewer, cases, "single-agent-baseline", args.parallelism
+        )
+        candidate = EndToEndEvaluationHarness().run(
+            candidate_reviewer, cases, "multi-agent-candidate", args.parallelism
+        )
+    finally:
+        baseline_reviewer.close()
+        candidate_reviewer.close()
     comparison = comparison_summary(baseline, candidate)
+    ab_summary = build_ab_summary(
+        "e2e",
+        baseline_rules=rule_catalog(LocalRuleReviewer.RULES),
+        introduced_rules=rule_catalog(ContextRuleReviewer.RULES),
+        llm=candidate_reviewer.service.llm_config,
+    )
     report = {
         "schema_version": 1,
         "baseline": baseline,
         "candidate": candidate,
         "comparison": comparison,
+        "ab_summary": ab_summary,
+        "execution": {
+            "path": "enqueue_review -> queue -> ReviewHarness -> persisted ReviewReport",
+            "baseline_task_database": "baseline-service.db",
+            "candidate_task_database": "candidate-service.db",
+            "llm": ab_summary["runtime_llm"],
+            "llm_timeout_seconds": args.llm_timeout_seconds if args.with_llm else None,
+            "parallelism": args.parallelism,
+        },
     }
-    os.makedirs(args.output_dir, exist_ok=True)
-    json_path = os.path.join(args.output_dir, "evaluation-report.json")
-    markdown_path = os.path.join(args.output_dir, "evaluation-report.md")
+    paths = report_paths(run_dir, "e2e-full-chain-ab-comparison")
+    json_path = paths["json"]
+    markdown_path = paths["markdown"]
     with open(json_path, "w", encoding="utf-8", newline="\n") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
     with open(markdown_path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(markdown_report(baseline, candidate, comparison))
+        handle.write(markdown_report(baseline, candidate, comparison, ab_summary))
 
     print("dataset:", args.dataset)
+    print("run directory:", run_dir)
     print("report:", json_path)
     print(
         "baseline F1=%s candidate F1=%s high-risk recall=%s clean accuracy=%s"

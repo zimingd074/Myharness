@@ -37,6 +37,10 @@ class GitHubClient:
         )
         return body.decode("utf-8", errors="replace")
 
+    def fetch_pull_request_diff(self, repository: str, number: int) -> str:
+        url = "https://api.github.com/repos/%s/pulls/%d" % (repository, number)
+        return self.fetch_diff(url)
+
     def post_comment(self, api_url: str, markdown: str) -> None:
         url = api_url.rstrip("/") + "/comments"
         request = urllib.request.Request(
@@ -106,6 +110,11 @@ class GitHubClient:
     def get_pull_request(self, repository: str, number: int) -> dict:
         return self._json("GET", "https://api.github.com/repos/%s/pulls/%d" % (repository, number))
 
+    def get_pull_request_head(self, repository: str, number: int) -> str:
+        """Return the immutable PR head SHA used by bounded snapshot retrieval."""
+        value = self.get_pull_request(repository, number)
+        return str((value.get("head") or {}).get("sha") or "")
+
     def get_file(self, repository: str, path: str, ref: str) -> dict:
         quoted = urllib.parse.quote(path, safe="/")
         result = self._json("GET", "https://api.github.com/repos/%s/contents/%s?ref=%s" % (
@@ -113,6 +122,14 @@ class GitHubClient:
         ))
         result["decoded_content"] = base64.b64decode(result["content"]).decode("utf-8")
         return result
+
+    def list_repository_paths(self, repository: str, ref: str, limit: int = 2000) -> list:
+        """Return a bounded PR-head file index for read-only retrieval tools."""
+        result = self._json("GET", "https://api.github.com/repos/%s/git/trees/%s?recursive=1" % (
+            repository, urllib.parse.quote(ref, safe="")
+        ))
+        return [str(item.get("path", "")) for item in list(result.get("tree") or [])
+                if item.get("type") == "blob" and item.get("path")][:max(1, limit)]
 
     def get_repository(self, repository: str) -> dict:
         return self._json("GET", "https://api.github.com/repos/%s" % repository)

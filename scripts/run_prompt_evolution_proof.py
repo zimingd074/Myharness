@@ -4,6 +4,7 @@ import sys
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPORT_DIR = os.path.join(ROOT, "tests", "evaluation_reports")
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
@@ -13,6 +14,7 @@ from evoagent.evolution_proof import (  # noqa: E402
     write_jsonl,
     write_report,
 )
+from evoagent.ab_report import timestamped_run_directory  # noqa: E402
 
 
 def main() -> None:
@@ -20,25 +22,25 @@ def main() -> None:
         description="Run an auditable feedback-driven prompt evolution replay."
     )
     parser.add_argument("--dataset", default="")
-    parser.add_argument(
-        "--output-dir", default=os.path.join("output", "prompt-evolution-proof")
-    )
     args = parser.parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    run_dir = timestamped_run_directory(
+        REPORT_DIR, "prompt-evolution-feedback-gates"
+    )
     dataset_path = args.dataset or os.path.join(
-        args.output_dir, "prompt-evolution-cases.jsonl"
+        run_dir, "prompt-evolution-cases.jsonl"
     )
     if not args.dataset:
         write_jsonl(generate_prompt_evolution_cases(), dataset_path)
-    database_path = os.path.join(args.output_dir, "prompt-evolution-proof.db")
+    database_path = os.path.join(run_dir, "prompt-evolution-proof.db")
     if os.path.exists(database_path):
         raise SystemExit(
-            "proof database already exists; choose a fresh --output-dir for an immutable run"
+            "proof database already exists in the fresh evaluation run directory"
         )
     report = run_prompt_evolution_proof(dataset_path, database_path)
-    paths = write_report(report, args.output_dir)
+    paths = write_report(report, run_dir)
     print("decision:", report["evolution_run"]["decision"])
     print("run_id:", report["evolution_run"]["run_id"])
+    print("run directory:", run_dir)
     print("json:", paths["json"])
     print("markdown:", paths["markdown"])
 

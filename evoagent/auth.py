@@ -18,8 +18,8 @@ ROLE_PERMISSIONS = {
 
 
 def hash_password(password: str, salt: Optional[bytes] = None) -> str:
-    if len(password) < 10:
-        raise ValueError("password must contain at least 10 characters")
+    if len(password) < 6:
+        raise ValueError("password must contain at least 6 characters")
     salt = salt or os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
     return "pbkdf2_sha256$310000$%s$%s" % (

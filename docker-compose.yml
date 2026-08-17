@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:16-alpine
+    ports:
+      - "5433:5432"
     environment:
       POSTGRES_DB: evoagent
       POSTGRES_USER: evoagent
@@ -13,15 +15,30 @@ services:
       timeout: 3s
       retries: 15
 
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redis_data:/data
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.3.1
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: -Xms256m -Xmx256m -Xmn128m
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "sh mqadmin clusterList -n localhost:9876 >/dev/null 2>&1"]
       interval: 5s
-      timeout: 3s
+      timeout: 10s
+      retries: 15
+
+  rocketmq-broker:
+    image: apache/rocketmq:5.3.1
+    command: sh mqbroker -n rocketmq-namesrv:9876
+    environment:
+      JAVA_OPT_EXT: -Xms256m -Xmx256m -Xmn128m
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+    depends_on:
+      rocketmq-namesrv:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "sh mqadmin clusterList -n rocketmq-namesrv:9876 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
       retries: 15
 
   evoagent:
@@ -31,25 +48,29 @@ services:
     environment:
       EVOAGENT_HOST: 0.0.0.0
       EVOAGENT_DATABASE_URL: postgresql://evoagent:evoagent-local@postgres:5432/evoagent
-      EVOAGENT_REDIS_URL: redis://redis:6379/0
+      EVOAGENT_ROCKETMQ_NAMESERVER: rocketmq-namesrv:9876
       EVOAGENT_ASYNC_WORKERS: 4
       EVOAGENT_SKILLS_DIR: /app/skills
       EVOAGENT_LLM_PROVIDER: ${EVOAGENT_LLM_PROVIDER:-local}
+      EVOAGENT_LLM_BASE_URL: ${EVOAGENT_LLM_BASE_URL:-}
+      EVOAGENT_LLM_API_KEY: ${EVOAGENT_LLM_API_KEY:-}
       EVOAGENT_LLM_MODEL: ${EVOAGENT_LLM_MODEL:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      EVOAGENT_GITHUB_WEBHOOK_SECRET: ${EVOAGENT_GITHUB_WEBHOOK_SECRET:-}
+      EVOAGENT_GITHUB_TOKEN: ${EVOAGENT_GITHUB_TOKEN:-}
+      EVOAGENT_AUTO_POST_REVIEW: ${EVOAGENT_AUTO_POST_REVIEW:-false}
       EVOAGENT_AUTH_REQUIRED: "true"
       EVOAGENT_AUTH_SECRET: ${EVOAGENT_AUTH_SECRET:-local-only-change-this-secret-123456}
       EVOAGENT_BOOTSTRAP_ADMIN_USERNAME: ${EVOAGENT_BOOTSTRAP_ADMIN_USERNAME:-admin}
-      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD:-evoagent-local-admin}
+      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD:-123456}
     env_file:
       - path: .env
         required: false
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      rocketmq-broker:
         condition: service_healthy
 
 volumes:
   postgres_data:
-  redis_data:

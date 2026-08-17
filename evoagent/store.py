@@ -2,7 +2,9 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from .models import ReviewReport, TaskState, TraceEvent
@@ -18,10 +20,15 @@ class TaskStore:
         self._lock = threading.Lock()
         self._init()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init(self) -> None:
         with self._connect() as conn:
@@ -141,6 +148,9 @@ class TaskStore:
             )
             self._ensure_column(conn, "tasks", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column(conn, "tasks", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "tasks", "run_token", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "tasks", "run_claim_token", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "tasks", "run_claimed_until", "TEXT")
             self._ensure_column(conn, "installations", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS checkpoints (
@@ -155,6 +165,7 @@ class TaskStore:
                     FOREIGN KEY(task_id) REFERENCES tasks(id)
                 )"""
             )
+            self._ensure_column(conn, "checkpoints", "fingerprint", "TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS task_payloads (
                     task_id TEXT PRIMARY KEY,
@@ -175,6 +186,12 @@ class TaskStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(task_id) REFERENCES tasks(id)
                 )"""
+            )
+            self._ensure_column(conn, "agent_messages", "event_key", "TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE agent_messages SET event_key='legacy:' || id WHERE event_key=''")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_event "
+                "ON agent_messages(task_id,event_key)"
             )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -281,6 +298,14 @@ class TaskStore:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS queue_dead_letters (
+                    message_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    failed_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
                 """CREATE TABLE IF NOT EXISTS agent_memories (
                     id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
@@ -323,38 +348,70 @@ class TaskStore:
                  json.dumps(payload), now, now, tenant_id),
             )
 
-    def transition(self, task_id: str, event: TraceEvent) -> None:
+    def transition(
+        self, task_id: str, event: TraceEvent, run_token: str = "", claim_token: str = "",
+    ) -> bool:
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?",
-                (event.state.value, event.created_at, task_id),
-            )
+            query = "UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?"
+            params = [event.state.value, event.created_at, task_id]
+            if run_token:
+                query += " AND run_token = ?"
+                params.append(run_token)
+            if claim_token:
+                query += " AND run_claim_token = ?"
+                params.append(claim_token)
+            cursor = conn.execute(query, params)
+            if cursor.rowcount != 1:
+                return False
             conn.execute(
                 "INSERT INTO trace_events(task_id, step, state, message, created_at) VALUES (?, ?, ?, ?, ?)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            return True
 
-    def succeed(self, task_id: str, report: ReviewReport, event: TraceEvent) -> None:
+    def succeed(
+        self, task_id: str, report: ReviewReport, event: TraceEvent,
+        run_token: str = "", claim_token: str = "",
+    ) -> bool:
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET state = ?, report_json = ?, updated_at = ? WHERE id = ?",
-                (TaskState.SUCCESS.value, json.dumps(report.to_dict(), ensure_ascii=False), event.created_at, task_id),
-            )
+            query = "UPDATE tasks SET state = ?, report_json = ?, updated_at = ? WHERE id = ?"
+            params = [TaskState.SUCCESS.value, json.dumps(report.to_dict(), ensure_ascii=False), event.created_at, task_id]
+            if run_token:
+                query += " AND run_token = ?"
+                params.append(run_token)
+            if claim_token:
+                query += " AND run_claim_token = ?"
+                params.append(claim_token)
+            cursor = conn.execute(query, params)
+            if cursor.rowcount != 1:
+                return False
             conn.execute(
                 "INSERT INTO trace_events(task_id, step, state, message, created_at) VALUES (?, ?, ?, ?, ?)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            return True
 
-    def fail(self, task_id: str, error: str, event: TraceEvent) -> None:
+    def fail(
+        self, task_id: str, error: str, event: TraceEvent,
+        run_token: str = "", claim_token: str = "",
+    ) -> bool:
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET state = ?, error = ?, updated_at = ? WHERE id = ?",
-                (TaskState.FAILED.value, error[:2000], event.created_at, task_id),
-            )
+            query = "UPDATE tasks SET state = ?, error = ?, updated_at = ? WHERE id = ?"
+            params = [TaskState.FAILED.value, error[:2000], event.created_at, task_id]
+            if run_token:
+                query += " AND run_token = ?"
+                params.append(run_token)
+            if claim_token:
+                query += " AND run_claim_token = ?"
+                params.append(claim_token)
+            cursor = conn.execute(query, params)
+            if cursor.rowcount != 1:
+                return False
             conn.execute(
                 "INSERT INTO trace_events(task_id, step, state, message, created_at) VALUES (?, ?, ?, ?, ?)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            return True
 
     def get(self, task_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -388,11 +445,12 @@ class TaskStore:
     def record_agent_message(self, task_id: str, message: Dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
-                "content_json,created_at) VALUES (?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
+                "content_json,created_at,event_key) VALUES (?,?,?,?,?,?,?,?)",
                 (task_id, message["sender"], message["recipient"], message["kind"],
                  message.get("correlation_id", ""),
-                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now()),
+                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now(),
+                 message.get("event_key", "")),
             )
 
     def save_agent_memory(self, memory: Dict[str, Any]) -> Dict[str, Any]:
@@ -401,7 +459,9 @@ class TaskStore:
                 "INSERT INTO agent_memories(id,tenant_id,repository,task_id,agent,scope,kind,"
                 "content,keywords_json,metadata_json,importance,created_at,expires_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-                "importance=MAX(agent_memories.importance,excluded.importance),"
+                "task_id=excluded.task_id,agent=excluded.agent,scope=excluded.scope,"
+                "kind=excluded.kind,content=excluded.content,keywords_json=excluded.keywords_json,"
+                "metadata_json=excluded.metadata_json,importance=excluded.importance,"
                 "expires_at=excluded.expires_at",
                 (
                     memory["id"], memory["tenant_id"], memory["repository"],
@@ -823,22 +883,38 @@ class TaskStore:
 
     def save_checkpoint(
         self, task_id: str, node: str, state: Dict[str, Any], status: str = "completed",
-        attempt: int = 1, error: str = "",
-    ) -> None:
+        attempt: int = 1, error: str = "", fingerprint: str = "", run_token: str = "",
+        claim_token: str = "",
+    ) -> bool:
         with self._lock, self._connect() as conn:
+            if run_token:
+                cursor = conn.execute(
+                    "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at,fingerprint) "
+                    "SELECT ?,?,?,?,?,?,?,? WHERE EXISTS "
+                    "(SELECT 1 FROM tasks WHERE id=? AND run_token=? AND run_claim_token=?) "
+                    "ON CONFLICT(task_id,node) DO UPDATE SET "
+                    "status=excluded.status,attempt=excluded.attempt,state_json=excluded.state_json,"
+                    "error=excluded.error,updated_at=excluded.updated_at,fingerprint=excluded.fingerprint "
+                    "WHERE EXISTS (SELECT 1 FROM tasks WHERE id=? AND run_token=? AND run_claim_token=?)",
+                    (task_id, node, status, attempt, json.dumps(state, ensure_ascii=False),
+                     error[:2000] or None, utc_now(), fingerprint, task_id, run_token, claim_token,
+                     task_id, run_token, claim_token),
+                )
+                return cursor.rowcount == 1
             conn.execute(
-                "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at) "
-                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(task_id,node) DO UPDATE SET "
+                "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at,fingerprint) "
+                "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(task_id,node) DO UPDATE SET "
                 "status=excluded.status,attempt=excluded.attempt,state_json=excluded.state_json,"
-                "error=excluded.error,updated_at=excluded.updated_at",
+                "error=excluded.error,updated_at=excluded.updated_at,fingerprint=excluded.fingerprint",
                 (task_id, node, status, attempt, json.dumps(state, ensure_ascii=False),
-                 error[:2000] or None, utc_now()),
+                 error[:2000] or None, utc_now(), fingerprint),
             )
+            return True
 
     def load_checkpoints(self, task_id: str) -> Dict[str, Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT node,status,attempt,state_json,error,updated_at FROM checkpoints "
+                "SELECT node,status,attempt,state_json,error,updated_at,fingerprint FROM checkpoints "
                 "WHERE task_id=? ORDER BY updated_at", (task_id,)
             ).fetchall()
         result = {}
@@ -847,6 +923,39 @@ class TaskStore:
             item["state"] = json.loads(item.pop("state_json"))
             result[item.pop("node")] = item
         return result
+
+    def issue_run_token(self, task_id: str) -> str:
+        token = uuid.uuid4().hex
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET run_token=?,run_claim_token='',run_claimed_until=NULL,updated_at=? WHERE id=?",
+                (token, utc_now(), task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("task not found")
+        return token
+
+    def claim_run(
+        self, task_id: str, run_token: str, claim_token: str, lease_seconds: int,
+    ) -> bool:
+        now = datetime.now(timezone.utc)
+        until = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET run_claim_token=?,run_claimed_until=? WHERE id=? AND run_token=? "
+                "AND (run_claimed_until IS NULL OR run_claimed_until < ?)",
+                (claim_token, until, task_id, run_token, now.isoformat()),
+            )
+            return cursor.rowcount == 1
+
+    def release_run(self, task_id: str, run_token: str, claim_token: str = "") -> None:
+        with self._lock, self._connect() as conn:
+            query = "UPDATE tasks SET run_claimed_until=NULL WHERE id=? AND run_token=?"
+            params = [task_id, run_token]
+            if claim_token:
+                query += " AND run_claim_token=?"
+                params.append(claim_token)
+            conn.execute(query, params)
 
     def save_task_payload(self, task_id: str, diff: str) -> None:
         with self._lock, self._connect() as conn:
@@ -891,16 +1000,26 @@ class TaskStore:
             row = conn.execute("SELECT cancel_requested FROM tasks WHERE id=?", (task_id,)).fetchone()
         return bool(row and row["cancel_requested"])
 
-    def cancel(self, task_id: str, event: TraceEvent) -> None:
+    def cancel(
+        self, task_id: str, event: TraceEvent, run_token: str = "", claim_token: str = "",
+    ) -> bool:
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET state=?,updated_at=? WHERE id=?",
-                (TaskState.CANCELLED.value, event.created_at, task_id),
-            )
+            query = "UPDATE tasks SET state=?,updated_at=? WHERE id=?"
+            params = [TaskState.CANCELLED.value, event.created_at, task_id]
+            if run_token:
+                query += " AND run_token=?"
+                params.append(run_token)
+            if claim_token:
+                query += " AND run_claim_token=?"
+                params.append(claim_token)
+            cursor = conn.execute(query, params)
+            if cursor.rowcount != 1:
+                return False
             conn.execute(
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (?,?,?,?,?)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            return True
 
     def claim_webhook(
         self, delivery_id: str, tenant_id: str, event_type: str, payload_sha256: str,
@@ -1162,6 +1281,33 @@ class TaskStore:
                 (tenant_id, max(1, min(limit, 500))),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_dead_letter(self, message_id: str, payload: Dict[str, Any], error: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO queue_dead_letters(message_id,payload_json,error,failed_at) "
+                "VALUES (?,?,?,?)",
+                (message_id, json.dumps(payload, ensure_ascii=False), error[:2000], utc_now()),
+            )
+
+    def list_dead_letters(self, limit: int = 100) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM queue_dead_letters ORDER BY failed_at DESC LIMIT ?",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
+
+    def get_dead_letter(self, message_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM queue_dead_letters WHERE message_id=?", (message_id,)
+            ).fetchone()
+        return ({**dict(row), "payload": json.loads(row["payload_json"])} if row else None)
+
+    def remove_dead_letter(self, message_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM queue_dead_letters WHERE message_id=?", (message_id,))
 
     def dashboard_stats(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
         with self._connect() as conn:

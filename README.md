@@ -9,13 +9,13 @@
 - Web 管理台、任务 Dashboard 与 Prometheus 指标
 - 安全、可靠性、AI 和动态 Skill Agent 并行协作
 - 独立分支上的保守型自动修复提交
-- PostgreSQL、Redis 生产模式
+- PostgreSQL、RocketMQ 生产模式
 - 失败案例回流、提示词评测、版本激活与回滚
 - 自研 Agent Runtime、持久化 checkpoint、执行预算与任务断点续跑
 - 带 Tool Registry、参数 Schema 校验和结构化 Observation 的有界 Agent Loop
 - 覆盖任务、工具、反馈、记忆、观察与 Diff 的统一 Context Window 和逐轮压缩
 - Working/Episodic/Semantic 分层记忆、租户级检索、任务归档与过期清理
-- Redis Streams ACK、Worker 租约、指数退避重试和死信队列
+- RocketMQ ACK、Broker 消费租约、失败重投和持久化死信队列
 - Webhook delivery 幂等、重放时间窗与评论 upsert
 - 用户登录、RBAC、租户/仓库隔离和不可变管理审计
 - 动态 Skill manifest 校验、签名校验和隔离进程沙箱
@@ -34,7 +34,7 @@ $bytes = New-Object byte[] 32
 $env:EVOAGENT_AUTH_REQUIRED = 'true'
 $env:EVOAGENT_AUTH_SECRET = [Convert]::ToBase64String($bytes)
 $env:EVOAGENT_BOOTSTRAP_ADMIN_USERNAME = 'admin'
-$env:EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD = '<替换为至少 10 个字符的密码>'
+$env:EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD = '<替换为至少 6 个字符的密码>'
 
 python -m evoagent
 ```
@@ -135,7 +135,7 @@ EVOAGENT_DEEPSEEK_API_KEY=你的真实APIKey
 python scripts/run_prompt_evolution_proof.py
 ```
 
-输出位于 `output/prompt-evolution-proof/`。该实验用于证明“反馈驱动的提示词版本确实改变 Agent 行为并通过隐藏集门禁”，数据来源仍是 `synthetic-controlled`，因此生产来源门禁保持失败；它不应被表述为外部 LLM 权重提升或真实公开 PR 上的生产效果。
+评测产物统一输出到 `tests/evaluation_reports/` 下以“时间戳_修改摘要”命名的独立子目录；JSON、Markdown、评测集副本与任务数据库都会归档在同一次运行目录中。端到端 A/B 评测使用 `python scripts/run_e2e_evaluation.py --reuse-dataset`，并通过 `enqueue_review → queue → ReviewHarness → 持久化 ReviewReport` 执行；添加 `--with-llm` 后，候选服务还会加载已配置的 OpenAI 兼容 LLM specialist。LLM 评测默认将模型请求、Agent Loop 和任务超时提高到 180 秒，可通过 `--llm-timeout-seconds` 调整；可使用 `--parallelism 4` 并发运行四条独立的完整任务链路。两类报告都会说明基线与候选技术、功能、代码逻辑优化、规则变化以及指标门禁。该实验用于证明“反馈驱动的提示词版本确实改变 Agent 行为并通过隐藏集门禁”，数据来源仍是 `synthetic-controlled`，因此生产来源门禁保持失败；它不应被表述为外部 LLM 权重提升或真实公开 PR 上的生产效果。
 
 ## Skill 自进化
 
@@ -270,7 +270,7 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-Compose 会启动 PostgreSQL、Redis 和 EvoAgent。未配置这两项时，项目自动退回 SQLite 与进程内线程队列，适合本地演示。
+Compose 会启动 PostgreSQL、RocketMQ NameServer/Broker 和 EvoAgent。未配置消息队列时，项目自动退回 SQLite 与进程内线程队列，适合本地演示。
 
 ## API
 
@@ -324,7 +324,7 @@ HTTP / GitHub Webhook
  ReviewHarness (EvoAgent Runtime / checkpoint / resume / budget / trace)
         │
         ├── DiffParser
-        ├── Redis Streams / ACK / lease / retry / DLQ
+        ├── RocketMQ / ACK / broker lease / retry / DLQ
         ├── ContextManager (unified token budget / iterative context compression)
         ├── MemoryManager (working / episodic / semantic / consolidation / expiry)
         └── MultiAgentCoordinator

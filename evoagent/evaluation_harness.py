@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -37,6 +38,9 @@ RULE_TO_CWE = {
     "REL-NONATOMIC-WRITE": "CWE-362",
     "SEC-OPEN-REDIRECT": "CWE-601",
     "SEC-LOG-FORGING": "CWE-117",
+    "BUSINESS-NEGATIVE-BALANCE": "CWE-840",
+    "SEC-AUTHZ-BYPASS": "CWE-863",
+    "COR-API-ARITY": "CWE-628",
 }
 
 
@@ -262,13 +266,21 @@ class EndToEndEvaluationHarness:
         self.line_tolerance = line_tolerance
         self.repairer = repairer
 
-    def run(self, reviewer: Reviewer, cases: List[dict], name: str = "") -> Dict[str, Any]:
+    def run(
+        self, reviewer: Reviewer, cases: List[dict], name: str = "", max_workers: int = 1,
+    ) -> Dict[str, Any]:
         started = time.monotonic()
         totals = self._empty_totals()
-        case_results = []
-        for case in cases:
-            result = self._run_case(reviewer, case)
-            case_results.append(result)
+        if max_workers < 1:
+            raise ValueError("max_workers must be positive")
+        if max_workers == 1:
+            case_results = [self._run_case(reviewer, case) for case in cases]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                case_results = list(executor.map(
+                    lambda case: self._run_case(reviewer, case), cases
+                ))
+        for result in case_results:
             self._accumulate(totals, result)
         metrics = self._metrics(totals)
         by_split = {}
@@ -285,6 +297,8 @@ class EndToEndEvaluationHarness:
             "schema_version": 1,
             "name": name or reviewer.name,
             "reviewer": reviewer.name,
+            "execution_path": getattr(reviewer, "execution_path", "direct-reviewer"),
+            "parallelism": max_workers,
             "dataset": {
                 "cases": len(cases),
                 "repositories": len({case["repository"] for case in cases}),
@@ -300,6 +314,7 @@ class EndToEndEvaluationHarness:
         }
 
     def _run_case(self, reviewer: Reviewer, case: dict) -> Dict[str, Any]:
+        case_started = time.monotonic()
         expected = list(case["expected_findings"])
         result = {
             "id": case["id"],
@@ -324,18 +339,40 @@ class EndToEndEvaluationHarness:
             "matches": [],
             "repair": [],
             "error": None,
+            "context": {},
+            "changed_files": 0,
+            "predictions": [],
+            "unmatched_predictions": [],
+            "exact_case_hit": False,
+            "evaluation_expectations": dict(case.get("evaluation_expectations") or {}),
+            "duration_seconds": 0.0,
         }
         try:
             parsed = parse_unified_diff(case["diff"])
-            findings = reviewer.review(case["diff"], parsed)
+            result["changed_files"] = len(parsed.files)
+            review_case = getattr(reviewer, "review_case", None)
+            findings = (
+                review_case(case, parsed)
+                if callable(review_case)
+                else reviewer.review(case["diff"], parsed)
+            )
             matches = one_to_one_match(expected, findings, self.line_tolerance)
             result["predicted"] = len(findings)
+            result["predictions"] = [item.to_dict() for item in findings]
             result["tp"] = len(matches)
             result["fp"] = len(findings) - len(matches)
             result["fn"] = len(expected) - len(matches)
             result["clean_hit"] = not expected and not findings
             result["execution_success"] = True
+            summary_reader = getattr(reviewer, "last_collaboration_summary", None)
+            if callable(summary_reader):
+                result["context"] = summary_reader()
             matched_expected = set()
+            matched_predictions = {match.predicted_index for match in matches}
+            result["unmatched_predictions"] = [
+                finding.to_dict() for index, finding in enumerate(findings)
+                if index not in matched_predictions
+            ]
             for match in matches:
                 truth = expected[match.expected_index]
                 finding = findings[match.predicted_index]
@@ -371,8 +408,10 @@ class EndToEndEvaluationHarness:
                 and result["repair_attempted"] == len(expected)
                 and result["repair_passed"] == len(expected)
             )
+            result["exact_case_hit"] = not result["fp"] and not result["fn"]
         except Exception as exc:
             result["error"] = str(exc)[:1000]
+        result["duration_seconds"] = round(time.monotonic() - case_started, 4)
         return result
 
     @staticmethod
@@ -382,6 +421,17 @@ class EndToEndEvaluationHarness:
             "fn": 0, "severity_hits": 0, "high_total": 0, "high_hits": 0,
             "clean_hits": 0, "execution_successes": 0, "repair_attempted": 0,
             "repair_passed": 0, "e2e_successes": 0,
+            "input_tokens": 0, "max_input_tokens": 0, "tool_calls": 0, "repo_tool_calls": 0,
+            "llm_calls": 0,
+            "output_tokens": 0, "cached_tokens": 0,
+            "budget_violations": 0, "review_completes": 0,
+            "shards": 0, "cross_shard_findings": 0, "coverage_gaps": 0,
+            "llm_failures": 0,
+            "retrieved_context_tokens": 0, "context_compaction_count": 0,
+            "compressed_rounds": 0, "pinned_evidence_count": 0,
+            "changed_files": 0, "reviewed_files": 0,
+            "changed_hunks": 0, "visible_hunks": 0,
+            "changed_added_lines": 0, "visible_added_lines": 0,
         }
 
     @staticmethod
@@ -397,6 +447,29 @@ class EndToEndEvaluationHarness:
         totals["clean_hits"] += int(result["clean_hit"])
         totals["execution_successes"] += int(result["execution_success"])
         totals["e2e_successes"] += int(result["e2e_success"])
+        context = result.get("context") or {}
+        totals["input_tokens"] += int(context.get("total_input_tokens", 0))
+        totals["max_input_tokens"] = max(totals["max_input_tokens"], int(context.get("max_input_tokens", 0)))
+        totals["tool_calls"] += int(context.get("tool_calls", 0))
+        totals["repo_tool_calls"] += int(context.get("repo_tool_calls", 0))
+        totals["llm_calls"] += int(context.get("llm_calls", 0))
+        totals["output_tokens"] += int(context.get("total_output_tokens", 0))
+        totals["cached_tokens"] += int(context.get("total_cached_tokens", 0))
+        totals["budget_violations"] += len((context.get("budget") or {}).get("violations", []))
+        totals["review_completes"] += int(bool(context.get("review_complete", False)))
+        totals["shards"] += int(context.get("shard_count", 0))
+        totals["cross_shard_findings"] += int(context.get("cross_shard_findings", 0))
+        totals["coverage_gaps"] += len(context.get("coverage_gaps", []))
+        totals["llm_failures"] += len(context.get("llm_failures", []))
+        for field in ("retrieved_context_tokens", "context_compaction_count",
+                      "compressed_rounds", "pinned_evidence_count"):
+            totals[field] += int(context.get(field, 0))
+        totals["changed_files"] += int(result.get("changed_files", 0))
+        totals["reviewed_files"] += len(context.get("reviewed_files", []))
+        totals["changed_hunks"] += int(context.get("changed_hunks", 0))
+        totals["visible_hunks"] += int(context.get("visible_hunks", 0))
+        totals["changed_added_lines"] += int(context.get("changed_added_lines", 0))
+        totals["visible_added_lines"] += int(context.get("visible_added_lines", 0))
 
     @staticmethod
     def _metrics(totals: Dict[str, int]) -> Dict[str, Any]:
@@ -419,11 +492,23 @@ class EndToEndEvaluationHarness:
             "execution_success_rate": ratio(
                 totals["execution_successes"], totals["cases"], 0.0
             ),
+            "review_complete_rate": ratio(totals["review_completes"], totals["cases"], 0.0),
             "safe_fix_rate": ratio(
                 totals["repair_passed"], totals["repair_attempted"], 0.0
             ),
             "e2e_security_fix_rate": ratio(
                 totals["e2e_successes"], totals["risk_cases"], 0.0
+            ),
+            "average_input_tokens": ratio(totals["input_tokens"], totals["cases"], 0.0),
+            "average_shards": ratio(totals["shards"], totals["cases"], 0.0),
+            "changed_file_coverage": ratio(totals["reviewed_files"], totals["changed_files"], 0.0),
+            # Compression may retain only a subset of a hunk.  Added-line
+            # visibility is therefore the truthful coverage denominator; keep
+            # the old hunk counters for backwards-compatible observability.
+            "changed_hunk_coverage": ratio(
+                totals["visible_added_lines"], totals["changed_added_lines"], 0.0
+            ) if totals["changed_added_lines"] else ratio(
+                totals["visible_hunks"], totals["changed_hunks"], 0.0
             ),
         }
 
@@ -512,3 +597,73 @@ def comparison_summary(
             "gates": gates,
         },
     }
+
+
+def memory_comparison(memory, cases: Iterable[dict]) -> Dict[str, Dict[str, float]]:
+    """Compare the former lexical Top-K policy with scoped memory recall.
+
+    Each deterministic case supplies assignment fields plus ``useful_memory_ids``;
+    it may additionally provide ``expected_lifecycle`` and
+    ``observed_lifecycle``.  This keeps Memory evaluation independent of a
+    model provider and makes stale/irrelevant injection measurable.
+    """
+    cases = list(cases)
+
+    def legacy(case: dict) -> List[dict]:
+        # Mirrors the pre-refactor MemoryManager ranking, including its old
+        # semantic zero-overlap admission behaviour.
+        query_tokens = set(re.findall(r"[A-Za-z0-9_./:-]{2,}", str(case.get("objective", "")).lower()))
+        values = memory.store.list_agent_memories(case.get("tenant_id", "default"), case["repository"], ("semantic", "episodic"), 200)
+        ranked = []
+        for index, item in enumerate(values):
+            tokens = set(item.get("keywords") or []) | set(re.findall(r"[A-Za-z0-9_./:-]{2,}", item.get("content", "").lower()))
+            overlap = len(query_tokens.intersection(tokens))
+            if query_tokens and overlap == 0 and item.get("scope") != "semantic":
+                continue
+            score = overlap / max(1, len(query_tokens)) * .55 + overlap / max(1, len(tokens)) * .15 + float(item.get("importance", .5)) * .25 + .05 / (index + 1)
+            value = dict(item)
+            value["recall_score"] = score
+            ranked.append(value)
+        return sorted(ranked, key=lambda item: -item["recall_score"])[:int(case.get("limit", memory.recall_limit))]
+
+    def scoped(case: dict) -> List[dict]:
+        return memory.recall_for_assignment(
+            case.get("tenant_id", "default"), case["repository"], case.get("task_id", ""),
+            case.get("agent", "reviewer"), case.get("shard_id", "full"), case.get("files", []),
+            case.get("symbols", []), case.get("risk_domains", []), case.get("objective", ""),
+            case.get("source_sha", ""), int(case.get("limit", memory.recall_limit)),
+        )
+
+    def score(recall) -> Dict[str, float]:
+        totals = {"recall_precision": 0.0, "memory_recall_hit_rate": 0.0, "irrelevant_memory_rate": 0.0,
+                  "stale_memory_injection_rate": 0.0, "cross_task_useful_memory_hit_rate": 0.0,
+                  "false_positive_reduction_after_human_feedback": 0.0,
+                  "repeat_finding_classification_accuracy": 0.0, "average_memory_tokens_injected_per_agent_shard": 0.0}
+        recalled = useful = stale = cross_task = feedback_hits = lifecycle_correct = lifecycle_total = 0
+        for case in cases:
+            items = recall(case)
+            useful_ids = set(case.get("useful_memory_ids", []))
+            ids = {item.get("id") for item in items}
+            recalled += len(items)
+            useful += len(ids.intersection(useful_ids))
+            stale += sum((item.get("metadata") or {}).get("status") == "needs_revalidation" for item in items)
+            cross_task += sum(item.get("id") in useful_ids and item.get("task_id") != case.get("task_id", "") for item in items)
+            feedback_hits += sum(item.get("id") in useful_ids and (item.get("metadata") or {}).get("source_type") == "human_feedback" for item in items)
+            totals["average_memory_tokens_injected_per_agent_shard"] += sum(len(str(item.get("content", ""))) / 4 for item in items)
+            if "expected_lifecycle" in case:
+                lifecycle_total += 1
+                lifecycle_correct += int(case.get("observed_lifecycle") == case["expected_lifecycle"])
+        count = max(1, len(cases))
+        totals["recall_precision"] = round(useful / recalled, 4) if recalled else 1.0
+        totals["memory_recall_hit_rate"] = round(sum(bool({item.get("id") for item in recall(case)}.intersection(set(case.get("useful_memory_ids", [])))) for case in cases) / count, 4)
+        totals["irrelevant_memory_rate"] = round(1 - totals["recall_precision"], 4)
+        totals["stale_memory_injection_rate"] = round(stale / recalled, 4) if recalled else 0.0
+        totals["cross_task_useful_memory_hit_rate"] = round(cross_task / count, 4)
+        totals["false_positive_reduction_after_human_feedback"] = round(feedback_hits / count, 4)
+        totals["repeat_finding_classification_accuracy"] = round(lifecycle_correct / lifecycle_total, 4) if lifecycle_total else 1.0
+        totals["average_memory_tokens_injected_per_agent_shard"] = round(totals["average_memory_tokens_injected_per_agent_shard"] / count, 2)
+        return totals
+
+    baseline, candidate = score(legacy), score(scoped)
+    return {"baseline": baseline, "new": candidate,
+            "deltas": {key: round(candidate[key] - baseline[key], 4) for key in baseline}}
