@@ -1,4 +1,4 @@
-"""Run the fixed 10-case self-reflection vs blind-challenger diagnostic."""
+"""Run the fixed 10-case self-reflection vs blind-auditor diagnostic."""
 import argparse
 import json
 import os
@@ -25,8 +25,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("offline", "real"), default="offline")
     parser.add_argument(
-        "--experiment", choices=("challenger", "domains"), default="challenger",
-        help="Isolate Challenger behavior or conditional Security/Reliability investigators",
+        "--experiment", choices=("auditor", "domains"), default="auditor",
+        help="Isolate Auditor behavior or conditional Security/Reliability investigators",
     )
     parser.add_argument("--dataset", default=os.path.join(ROOT, "evaluation_data", "multi_agent_ablation_10.jsonl"))
     parser.add_argument("--output", default=os.path.join(ROOT, "reports", "multi_agent_ablation.json"))

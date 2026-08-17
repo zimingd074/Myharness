@@ -119,11 +119,11 @@ class MultiAgentAblationTests(unittest.TestCase):
 
         preferred = {
             "single_self_reflect": PairReviewer("a", "custom", "qwen3.7-max", True),
-            "independent_challenger": PairReviewer("b", "custom", "qwen3.7-max"),
+            "independent_auditor": PairReviewer("b", "custom", "qwen3.7-max"),
         }
         fallback = {
             "single_self_reflect": PairReviewer("fa", "deepseek", "deepseek-v4-flash"),
-            "independent_challenger": PairReviewer("fb", "deepseek", "deepseek-v4-flash"),
+            "independent_auditor": PairReviewer("fb", "deepseek", "deepseek-v4-flash"),
         }
         cases = load_jsonl(DATASET)[:1]
         controls = fairness_manifest(cases, "qwen3.7-max", "same", "rules", AB_BUDGET)
@@ -131,7 +131,7 @@ class MultiAgentAblationTests(unittest.TestCase):
             cases, preferred, controls, fallback_reviewers=fallback,
         )
         self.assertEqual(1, fallback["single_self_reflect"].calls)
-        self.assertEqual(1, fallback["independent_challenger"].calls)
+        self.assertEqual(1, fallback["independent_auditor"].calls)
         pair = report["comparison"]["pair_manifests"][0]
         self.assertTrue(pair["valid"])
         self.assertEqual(["deepseek-v4-flash"], pair["model"])
@@ -192,18 +192,18 @@ class MultiAgentAblationTests(unittest.TestCase):
             cases, canned_arm_reviewers(include_conditional=True), controls, offline=True,
         )
         self.assertEqual(
-            {"single_self_reflect", "independent_challenger", "conditional_adaptive"},
+            {"single_self_reflect", "independent_auditor", "conditional_adaptive"},
             set(report["arms"]),
         )
         self.assertEqual(
             "conditional_adaptive",
             report["comparison"]["diagnostic_gate"]["candidate_arm"],
         )
-        forced = report["arms"]["independent_challenger"]["metrics"]
+        forced = report["arms"]["independent_auditor"]["metrics"]
         conditional = report["arms"]["conditional_adaptive"]["metrics"]
         self.assertEqual(1.0, forced["challenge_activation_rate"])
         self.assertLess(conditional["challenge_activation_rate"], 1.0)
-        self.assertLess(conditional["challenger_run_count"], forced["challenger_run_count"])
+        self.assertLess(conditional["auditor_run_count"], forced["auditor_run_count"])
 
     def test_domain_ablation_routes_only_positive_contrast_cases(self):
         cases = load_jsonl(DATASET)

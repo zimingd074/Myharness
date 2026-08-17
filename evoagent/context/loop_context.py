@@ -62,7 +62,7 @@ class LoopContext:
         legacy_id = "R%d" % step
         # The next model turn must be able to cite the observation it just
         # produced.  Previously the alias lived only in an internal map, so a
-        # strict Challenger could not return any valid evidence_refs.
+        # strict Auditor could not return any valid evidence_refs.
         observation["evidence_id"] = evidence_id
         observation["evidence_alias"] = legacy_id
         self.rounds[-1].observation.update({

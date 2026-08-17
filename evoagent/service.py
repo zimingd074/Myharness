@@ -19,10 +19,13 @@ from .observability import AlertManager, Observability
 from .postgres_store import create_store
 from .report import to_markdown
 from .reviewer import (
-    ContextRuleReviewer, EvidenceChallengeAgent, LocalRuleReviewer,
+    ContextRuleReviewer, LocalRuleReviewer,
     OpenAICompatibleReviewer, PrimaryReviewAgent, ReliabilityImpactAgent,
     ReliabilityRuleReviewer, SecurityInvestigatorAgent, SecurityRuleReviewer,
 )
+from .auditor_agent import AuditorReviewAgent
+from .cross_shard_tracer_agent import CrossShardTracerReviewAgent
+from .verifier_agent import VerifierReviewAgent
 from .diff_parser import parse_unified_diff
 from .skills import SkillRegistry
 from .skill_evolution import DeclarativeSkillReviewer, SkillEvolutionEngine
@@ -167,7 +170,9 @@ class ReviewService:
             reviewers = list(reviewers) + [
                 SecurityInvestigatorAgent(*args, **common),
                 ReliabilityImpactAgent(*args, **common),
-                EvidenceChallengeAgent(*args, **common),
+                CrossShardTracerReviewAgent(*args, **common),
+                VerifierReviewAgent(*args, **common),
+                AuditorReviewAgent(*args, **common),
             ]
         return MultiAgentCoordinator(
             reviewers, max_workers=self.settings.agent_max_workers, store=self.store,
@@ -187,8 +192,9 @@ class ReviewService:
             shard_changed_line_threshold=self.settings.context_shard_changed_line_threshold,
             snapshot_factory=snapshot_factory,
             review_mode=effective_mode,
+            review_pipeline=self.settings.review_pipeline,
             challenge_strategy=(
-                "independent_challenger" if effective_mode == "adaptive_multi_agent"
+                "independent_auditor" if effective_mode == "adaptive_multi_agent"
                 else "self_reflect"
             ),
             agent_budget={

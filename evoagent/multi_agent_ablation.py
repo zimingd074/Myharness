@@ -1,4 +1,4 @@
-"""Fair, diagnostic A/B evaluation of self-reflection vs a blind challenger."""
+"""Fair, diagnostic A/B evaluation of self-reflection vs a blind auditor."""
 import hashlib
 import copy
 import json
@@ -16,7 +16,7 @@ from .diff_parser import ParsedDiff
 from .evaluation_harness import EndToEndEvaluationHarness, dataset_fingerprint
 from .models import Finding, Severity
 from .reviewer import (
-    ContextRuleReviewer, EvidenceChallengeAgent, PrimaryReviewAgent,
+    ContextRuleReviewer, EvidenceAuditAgent, PrimaryReviewAgent,
     ReliabilityImpactAgent, ReliabilityRuleReviewer, Reviewer,
     SecurityInvestigatorAgent, SecurityRuleReviewer,
 )
@@ -61,7 +61,7 @@ class CannedAdaptiveAgent(Reviewer):
         if auth and key not in self._seen:
             self._seen.add(key)
             return {"action": "tool", "tool": "grep_repo", "arguments": {"query": "tenant_id", "limit": 20}, "reason": "verify authorization ownership model"}
-        if self.agent_role == "challenger" and key not in self._seen:
+        if self.agent_role == "auditor" and key not in self._seen:
             self._seen.add(key)
             return {"action": "tool", "tool": "grep_repo", "arguments": {"query": "def ", "limit": 20}, "reason": "independent structural check"}
         if reason == "blind-challenge":
@@ -144,12 +144,12 @@ class AblationArmReviewer(Reviewer):
     execution_path = "adaptive-ablation"
 
     def __init__(self, name: str, primary_factory: Callable[[], Reviewer],
-                 challenger_factory: Optional[Callable[[], Reviewer]], budget=None,
+                 auditor_factory: Optional[Callable[[], Reviewer]], budget=None,
                  timeout_seconds: int = 300, force_challenge: bool = True,
                  domain_factories=()):
         self.name = name
         self.primary_factory = primary_factory
-        self.challenger_factory = challenger_factory
+        self.auditor_factory = auditor_factory
         self.budget = dict(budget or AB_BUDGET)
         self.timeout_seconds = timeout_seconds
         self.force_challenge = force_challenge
@@ -165,9 +165,9 @@ class AblationArmReviewer(Reviewer):
         agents.extend(factory() for factory in self.domain_factories)
         strategy = "self_reflect"
         mode = "single_agent"
-        if self.challenger_factory is not None:
-            agents.append(self.challenger_factory())
-            strategy, mode = "independent_challenger", "adaptive_multi_agent"
+        if self.auditor_factory is not None:
+            agents.append(self.auditor_factory())
+            strategy, mode = "independent_auditor", "adaptive_multi_agent"
         elif self.domain_factories:
             mode = "adaptive_multi_agent"
         coordinator = MultiAgentCoordinator(
@@ -185,7 +185,7 @@ class AblationArmReviewer(Reviewer):
             task_id, case["diff"], parsed, repository=case["repository"],
             pull_request=int(case["pull_request"]),
             source_sha=dataset_fingerprint([case]),
-            execution_context={"experiment": "independent-challenger-v1", "arm": self.name,
+            execution_context={"experiment": "independent-auditor-v1", "arm": self.name,
                                "force_challenge": self.force_challenge,
                                # Allow one structural lookup, one final answer,
                                # and one schema-repair request in a stage.
@@ -208,15 +208,15 @@ def canned_arm_reviewers(budget=None, include_conditional: bool = False) -> Dict
         "single_self_reflect": AblationArmReviewer(
             "single_self_reflect", primary, None, budget,
         ),
-        "independent_challenger": AblationArmReviewer(
-            "independent_challenger", primary,
-            lambda: CannedAdaptiveAgent("challenger"), budget,
+        "independent_auditor": AblationArmReviewer(
+            "independent_auditor", primary,
+            lambda: CannedAdaptiveAgent("auditor"), budget,
         ),
     }
     if include_conditional:
         reviewers["conditional_adaptive"] = AblationArmReviewer(
             "conditional_adaptive", primary,
-            lambda: CannedAdaptiveAgent("challenger"), budget,
+            lambda: CannedAdaptiveAgent("auditor"), budget,
             force_challenge=False,
         )
     return reviewers
@@ -226,15 +226,15 @@ def canned_domain_arm_reviewers(budget=None) -> Dict[str, Reviewer]:
     cache = SharedPrimaryActionCache()
     def primary():
         return SharedPrimaryAgent(CannedAdaptiveAgent("primary"), cache)
-    def challenger():
-        return CannedAdaptiveAgent("challenger")
+    def auditor():
+        return CannedAdaptiveAgent("auditor")
     return {
         "conditional_primary": AblationArmReviewer(
-            "conditional_primary", primary, challenger, budget,
+            "conditional_primary", primary, auditor, budget,
             force_challenge=False,
         ),
         "conditional_domain_agents": AblationArmReviewer(
-            "conditional_domain_agents", primary, challenger, budget,
+            "conditional_domain_agents", primary, auditor, budget,
             force_challenge=False,
             domain_factories=(
                 lambda: CannedAdaptiveAgent("security"),
@@ -258,15 +258,15 @@ def model_arm_reviewers(config: dict, budget=None, timeout_seconds: int = 300,
     cache = SharedPrimaryActionCache()
     def primary():
         return SharedPrimaryAgent(PrimaryReviewAgent(**common), cache)
-    def challenger():
-        return EvidenceChallengeAgent(**common)
+    def auditor():
+        return EvidenceAuditAgent(**common)
     reviewers = {
         "single_self_reflect": AblationArmReviewer("single_self_reflect", primary, None, budget, timeout_seconds),
-        "independent_challenger": AblationArmReviewer("independent_challenger", primary, challenger, budget, timeout_seconds),
+        "independent_auditor": AblationArmReviewer("independent_auditor", primary, auditor, budget, timeout_seconds),
     }
     if include_conditional:
         reviewers["conditional_adaptive"] = AblationArmReviewer(
-            "conditional_adaptive", primary, challenger, budget,
+            "conditional_adaptive", primary, auditor, budget,
             timeout_seconds, force_challenge=False,
         )
     return reviewers
@@ -278,7 +278,7 @@ def model_domain_arm_reviewers(
 ) -> Dict[str, Reviewer]:
     """Primary-only versus conditionally routed domain investigators.
 
-    Both arms use the same conditional Challenger, so the only experimental
+    Both arms use the same conditional Auditor, so the only experimental
     variable is Security/Reliability investigator activation.
     """
     common = dict(
@@ -290,15 +290,15 @@ def model_domain_arm_reviewers(
     cache = SharedPrimaryActionCache()
     def primary():
         return SharedPrimaryAgent(PrimaryReviewAgent(**common), cache)
-    def challenger():
-        return EvidenceChallengeAgent(**common)
+    def auditor():
+        return EvidenceAuditAgent(**common)
     return {
         "conditional_primary": AblationArmReviewer(
-            "conditional_primary", primary, challenger, budget,
+            "conditional_primary", primary, auditor, budget,
             timeout_seconds, force_challenge=False,
         ),
         "conditional_domain_agents": AblationArmReviewer(
-            "conditional_domain_agents", primary, challenger, budget,
+            "conditional_domain_agents", primary, auditor, budget,
             timeout_seconds, force_challenge=False,
             domain_factories=(
                 lambda: SecurityInvestigatorAgent(**common),
@@ -333,8 +333,8 @@ def _summarize(name: str, cases: List[dict], results: List[dict]) -> dict:
         bool((item.get("context") or {}).get("challenge_activation", {}).get("triggered"))
         for item in results
     ) / len(results), 4) if results else 0.0
-    metrics["challenger_run_count"] = sum(
-        (run.get("spec") or {}).get("role") == "challenger"
+    metrics["auditor_run_count"] = sum(
+        (run.get("spec") or {}).get("role") == "auditor"
         for item in results for run in (item.get("context") or {}).get("agent_runs", [])
     )
     metrics["security_agent_run_count"] = sum(
@@ -584,7 +584,7 @@ def run_paired_ablation(cases: List[dict], reviewers: Dict[str, Reviewer], contr
         raise ValueError("baseline arm is missing: %s" % baseline_name)
     candidate_name = candidate_name or (
         "conditional_adaptive" if "conditional_adaptive" in reviewers
-        else "independent_challenger"
+        else "independent_auditor"
     )
     if candidate_name not in reviewers:
         raise ValueError("candidate arm is missing: %s" % candidate_name)
@@ -703,7 +703,7 @@ def run_paired_ablation(cases: List[dict], reviewers: Dict[str, Reviewer], contr
         or float(b.get("cross_file_pair_accuracy") or 0)
         > float(a.get("cross_file_pair_accuracy") or 0)
     )
-    challenger_gate = (
+    auditor_gate = (
         delta["exact_case_accuracy"] >= .1 and delta["high_risk_recall"] >= 0
         and delta["clean_accuracy"] >= 0 and delta["holdout_f1"] >= 0
         and unmatched_b <= unmatched_a and semantic_or_cross_file_gain
@@ -713,7 +713,7 @@ def run_paired_ablation(cases: List[dict], reviewers: Dict[str, Reviewer], contr
     # Compatibility name follows the declared candidate-only gate semantics.
     execution_valid = candidate_execution_valid
     status = (
-        "diagnostic-pass" if candidate_gate and challenger_gate else "fail"
+        "diagnostic-pass" if candidate_gate and auditor_gate else "fail"
     ) if has_diagnostic_metadata else "benchmark-complete"
     if not fairness["valid"] or not execution_valid:
         status = "invalid"
@@ -727,7 +727,7 @@ def run_paired_ablation(cases: List[dict], reviewers: Dict[str, Reviewer], contr
         by_model[label]["pair_count"] += 1
     return {
         "schema_version": 2,
-        "experiment": {"id": ("conditional-domain-agents-v1" if candidate_name == "conditional_domain_agents" else "conditional-adaptive-v2" if candidate_name == "conditional_adaptive" else "independent-challenger-v1"), "hypothesis": ("Conditionally routed security and reliability investigators add quality beyond the same Primary and Challenger." if candidate_name == "conditional_domain_agents" else "A claim-admitted conditional challenger improves exact review decisions."), "controls": controls},
+        "experiment": {"id": ("conditional-domain-agents-v1" if candidate_name == "conditional_domain_agents" else "conditional-adaptive-v2" if candidate_name == "conditional_adaptive" else "independent-auditor-v1"), "hypothesis": ("Conditionally routed security and reliability investigators add quality beyond the same Primary and Auditor." if candidate_name == "conditional_domain_agents" else "A claim-admitted conditional auditor improves exact review decisions."), "controls": controls},
         "arms": arms,
         "comparison": {"fairness_checks": fairness, "paired_deltas": delta,
                        "pair_manifests": pair_manifests,
@@ -749,7 +749,7 @@ def run_paired_ablation(cases: List[dict], reviewers: Dict[str, Reviewer], contr
                                            "execution_valid": execution_valid,
                                            "candidate_execution_valid": candidate_execution_valid,
                                            "baseline_execution_valid": baseline_execution_valid,
-                                           "challenger_gate": challenger_gate,
+                                           "auditor_gate": auditor_gate,
                                            "semantic_or_cross_file_gain": semantic_or_cross_file_gain,
                                            "unmatched_fp_delta": unmatched_b - unmatched_a},
                        "production_activation_allowed": False},
@@ -761,12 +761,12 @@ def render_markdown(report: dict) -> str:
     arm_names = list(report["arms"])
     labels = {
         "single_self_reflect": "Self-reflect",
-        "independent_challenger": "Forced challenger",
+        "independent_auditor": "Forced auditor",
         "conditional_adaptive": "Conditional adaptive",
         "conditional_primary": "Conditional Primary",
         "conditional_domain_agents": "Conditional domain Agents",
     }
-    rows = ["# EvoAgent multi-agent challenger A/B", "",
+    rows = ["# EvoAgent multi-agent auditor A/B", "",
             "| Metric | " + " | ".join(labels.get(name, name) for name in arm_names) + " |",
             "|---|" + "---:|" * len(arm_names)]
     for key in ("precision", "recall", "f1", "exact_case_accuracy", "high_risk_recall", "clean_accuracy", "hard_negative_accuracy", "semantic_recall", "cross_file_pair_accuracy", "evidence_traceability_rate", "required_evidence_accuracy"):

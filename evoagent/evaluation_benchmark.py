@@ -467,7 +467,7 @@ def generate_controlled_pr_cases() -> List[dict]:
 
 
 def generate_multi_agent_ablation_cases() -> List[dict]:
-    """Return the fixed 10-case diagnostic set for challenger ablation.
+    """Return the fixed 10-case diagnostic set for auditor ablation.
 
     The set is intentionally synthetic and contrastive.  It validates review
     architecture and must never be used to enable a production rollout.

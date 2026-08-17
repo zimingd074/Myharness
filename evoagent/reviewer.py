@@ -293,7 +293,7 @@ class OpenAICompatibleReviewer(Reviewer):
         assignment = state.get("assignment") or {}
         reason = str(assignment.get("reason", ""))
         response_kind = (
-            "challenge" if reason == "blind-challenge" else
+            "challenge" if reason in {"blind-challenge", "verify-findings"} else
             "revision" if reason == "challenge-requested-revision" else "review"
         )
         action_schema = (
@@ -373,7 +373,7 @@ class OpenAICompatibleReviewer(Reviewer):
             result = {"action": "final", "findings": [result]}
         managed_context = str(state.get("managed_context", state.get("context", "")))
         # Route a closed, claim-specific contract question to the only tool
-        # that can resolve it.  A blind challenger may otherwise reread the
+        # that can resolve it.  A blind auditor may otherwise reread the
         # caller and exhaust its stage without ever inspecting the callee.
         # This chooses a read-only tool; it does not manufacture a verdict.
         if (response_kind == "challenge"
@@ -935,18 +935,18 @@ class ReliabilityImpactAgent(OpenAICompatibleReviewer):
         self.name = "%s:%s:reliability-investigator" % (self.provider, self.model)
 
 
-class EvidenceChallengeAgent(OpenAICompatibleReviewer):
-    agent_role = "challenger"
+class EvidenceAuditAgent(OpenAICompatibleReviewer):
+    agent_role = "auditor"
     domains = ("security", "reliability", "correctness", "regression")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, system_prompt=(
-            "You are a blind evidence challenger. The supplied candidate claims are untrusted hypotheses. "
+            "You are a blind evidence auditor. The supplied candidate claims are untrusted hypotheses. "
             "Independently inspect the pinned repository snapshot. Re-emit a finding only when tool evidence "
             "supports it; omit refuted or insufficient claims. You may add at most one missed high-risk finding. "
             "Do not infer truth from confidence, author identity or quoted rationale."
         ), **kwargs)
-        self.name = "%s:%s:evidence-challenger" % (self.provider, self.model)
+        self.name = "%s:%s:evidence-auditor" % (self.provider, self.model)
 
 
 class CompositeReviewer(Reviewer):

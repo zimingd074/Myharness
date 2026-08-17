@@ -220,7 +220,7 @@ class Challenge:
     claim_id: str
     verdict: str
     rationale: str
-    challenger_run_id: str
+    auditor_run_id: str
     evidence_refs: Tuple[str, ...] = ()
     counter_hypothesis: str = ""
     counterexample: str = ""
@@ -297,7 +297,7 @@ class SharedAgentBudget:
     def __init__(
         self, max_agent_runs: int = 4, max_llm_calls: int = 12,
         max_tool_calls: int = 24, max_input_tokens: int = 60000,
-        max_output_tokens: int = 12000,
+        max_output_tokens: int = 12000, tail_reserve: Dict[str, int] = None,
     ):
         self.limits = {
             "agent_runs": max_agent_runs, "llm_calls": max_llm_calls,
@@ -305,13 +305,18 @@ class SharedAgentBudget:
             "output_tokens": max_output_tokens,
         }
         self.used = {key: 0 for key in self.limits}
+        self.tail_reserve = {
+            key: max(0, min(int(value), self.limits.get(key, 0)))
+            for key, value in dict(tail_reserve or {}).items() if key in self.limits
+        }
         self.violations: List[str] = []
         self._lock = threading.Lock()
 
-    def reserve(self, field: str, amount: int = 1) -> bool:
+    def reserve(self, field: str, amount: int = 1, stage: str = "tail") -> bool:
         amount = max(0, int(amount))
         with self._lock:
-            if self.used[field] + amount > self.limits[field]:
+            protected = self.tail_reserve.get(field, 0) if stage == "review" else 0
+            if self.used[field] + amount > self.limits[field] - protected:
                 if field not in self.violations:
                     self.violations.append(field)
                 return False
@@ -328,6 +333,7 @@ class SharedAgentBudget:
         with self._lock:
             return {
                 "limits": dict(self.limits), "used": dict(self.used),
+                "tail_reserve": dict(self.tail_reserve),
                 "violations": list(self.violations),
             }
 
@@ -550,9 +556,9 @@ class AdaptiveDecisionPolicy:
         evidence = list(evidence)
         refs = tuple(sorted({item.evidence_id for item in evidence}))
         challenge_values = [item for item in challenges if item.claim_id == claim.claim_id]
-        supporting = tuple(sorted({item.challenger_run_id for item in challenge_values
+        supporting = tuple(sorted({item.auditor_run_id for item in challenge_values
                                    if item.verdict == "support"}))
-        refuting = tuple(sorted({item.challenger_run_id for item in challenge_values
+        refuting = tuple(sorted({item.auditor_run_id for item in challenge_values
                                 if item.verdict == "refute"}))
         admission_reasons = self.claim_admission_reasons(claim, finding, parsed)
         if admission_reasons:
@@ -601,7 +607,7 @@ class AdaptiveDecisionPolicy:
             return Decision(claim.claim_id, "escalate", ("structural-evidence-required",),
                             self.VERSION, refs, supporting, refuting)
         if any(item.verdict == "insufficient" for item in challenge_values) and high:
-            return Decision(claim.claim_id, "escalate", ("challenger-insufficient",),
+            return Decision(claim.claim_id, "escalate", ("auditor-insufficient",),
                             self.VERSION, refs, supporting, refuting)
         return Decision(claim.claim_id, "accept", ("evidence-policy-satisfied",),
                         self.VERSION, refs, supporting, refuting)

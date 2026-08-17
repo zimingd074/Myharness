@@ -20,6 +20,11 @@ from .context.pr_map import PRContextMap, build_pr_context_map
 from .context.retrieval import RepositoryRetrieval, RepositorySnapshotProvider
 from .context.evidence import EvidenceLedger
 from .context.shard_planner import ReviewShard, ShardPlanner
+from .context.budget_policy import BudgetPolicy
+from .context.coverage import CoverageReceipt
+from .context.risk_priority import DiffRiskScanner
+from .verifier_agent import VerifierAgentNode
+from .auditor_agent import AuditStopPolicy, AuditorAgentNode
 from .diff_parser import ParsedDiff
 from .memory import MemoryManager
 from .models import Finding, Severity
@@ -97,6 +102,9 @@ class ReviewAssignment:
     shard_id: str = ""
     shard_files: List[str] = field(default_factory=list)
     coverage_scope: str = "full-pr"
+    budget: Dict[str, int] = field(default_factory=dict)
+    required_hunk_ids: List[str] = field(default_factory=list)
+    priority_hunks: List[Dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -108,6 +116,8 @@ class ReviewPlan:
     changed_files: List[str]
     risk_level: str
     assignments: List[ReviewAssignment]
+    audit_rounds: int = BudgetPolicy.REVERSE_AUDIT_ROUNDS
+    dry_round_limit: int = BudgetPolicy.REVERSE_AUDIT_DRY_ROUNDS
 
     def to_dict(self) -> dict:
         return {
@@ -115,7 +125,22 @@ class ReviewPlan:
             "changed_files": self.changed_files,
             "risk_level": self.risk_level,
             "assignments": [item.to_dict() for item in self.assignments],
+            "audit_rounds": self.audit_rounds,
+            "dry_round_limit": self.dry_round_limit,
         }
+
+
+class CrossShardTracerAgent:
+    """A graph node contract, backed by one short existing AgentLoop run."""
+
+    name = "cross-shard-tracer"
+
+    @staticmethod
+    def objective() -> str:
+        return ("Trace cross-file caller/callee, API, schema, and producer/consumer "
+                "contracts for changed symbols. For a removed guard, locate a possible "
+                "replacement only; leave security-policy judgment to the Security agent. "
+                "Use repository tools; do not re-read specialist conversations.")
 
 
 @dataclass
@@ -183,6 +208,8 @@ class CollaborationState(TypedDict, total=False):
     escalations: List[dict]
     agent_runs: List[AgentRun]
     shared_budget: SharedAgentBudget
+    coverage_receipts: List[dict]
+    budget_gaps: List[dict]
 
 
 def finding_key(finding: Finding) -> str:
@@ -443,7 +470,7 @@ class MultiAgentCoordinator(Reviewer):
         context_manager: Optional[ContextManager] = None,
         memory_manager: Optional[MemoryManager] = None,
         agent_loop_max_steps: int = 6, agent_loop_timeout_seconds: int = 120,
-        agent_runtime_max_steps: int = 8, agent_runtime_timeout_seconds: int = 300,
+        agent_runtime_max_steps: int = 12, agent_runtime_timeout_seconds: int = 300,
         context_active_rounds: int = 3, context_soft_compact_ratio: float = .60,
         context_hard_compact_ratio: float = .80,
         context_architecture: str = "coverage-first",
@@ -451,8 +478,9 @@ class MultiAgentCoordinator(Reviewer):
         shard_file_threshold: int = 12, shard_changed_line_threshold: int = 1200,
         snapshot_provider: Optional[RepositorySnapshotProvider] = None,
         snapshot_factory=None,
-        review_mode: str = "legacy", challenge_strategy: str = "independent_challenger",
+        review_mode: str = "legacy", challenge_strategy: str = "independent_auditor",
         agent_budget: Optional[Dict[str, int]] = None,
+        review_pipeline: str = "classic",
     ):
         self.agents = agents
         self.max_workers = max_workers
@@ -484,15 +512,29 @@ class MultiAgentCoordinator(Reviewer):
         self.snapshot_factory = snapshot_factory
         if review_mode not in {"legacy", "rules_only", "single_agent", "adaptive_multi_agent"}:
             raise ValueError("invalid review_mode: %s" % review_mode)
-        if challenge_strategy not in {"self_reflect", "independent_challenger"}:
+        if challenge_strategy not in {"self_reflect", "independent_auditor"}:
             raise ValueError("invalid challenge_strategy: %s" % challenge_strategy)
         self.review_mode = review_mode
         self.challenge_strategy = challenge_strategy
         self.agent_budget = dict(agent_budget or {})
+        if review_pipeline not in {"classic", "bounded-v2"}:
+            raise ValueError("review_pipeline must be classic or bounded-v2")
+        self.review_pipeline = review_pipeline
+        self.budget_policy = BudgetPolicy()
+        self.cross_shard_tracer = CrossShardTracerAgent()
+        self.verifier_stage = VerifierAgentNode(self.budget_policy.VERIFIER_BATCH_SIZE)
+        self.auditor_stage = AuditorAgentNode(AuditStopPolicy(
+            self.budget_policy.REVERSE_AUDIT_ROUNDS,
+            self.budget_policy.REVERSE_AUDIT_DRY_ROUNDS,
+        ))
         self.risk_router = DeterministicRiskRouter()
         self.decision_policy = AdaptiveDecisionPolicy()
+        # The bounded graph has ten deterministic orchestration nodes. Its
+        # runtime limit governs graph progress, not model/tool spend, so never
+        # let an old eight-step deployment abort before final adjudication.
+        runtime_steps = max(10, agent_runtime_max_steps) if self.review_pipeline == "bounded-v2" else agent_runtime_max_steps
         self.runtime = AgentRuntime(
-            max_steps=agent_runtime_max_steps, timeout_seconds=agent_runtime_timeout_seconds,
+            max_steps=runtime_steps, timeout_seconds=agent_runtime_timeout_seconds,
         )
         self.planner = PlannerAgent()
         self.critic = CriticAgent()
@@ -528,7 +570,15 @@ class MultiAgentCoordinator(Reviewer):
             "source_sha": source_sha or ("diff:" + hashlib.sha256(diff.encode("utf-8")).hexdigest()),
             "claims": [], "challenges": [], "adaptive_decisions": [],
             "escalations": [], "agent_runs": [],
-            "shared_budget": SharedAgentBudget(**self.agent_budget),
+            "shared_budget": SharedAgentBudget(
+                **self.agent_budget,
+                tail_reserve=(self.budget_policy.tail_reserve({
+                    "agent_runs": self.agent_budget.get("max_agent_runs", 4),
+                    "llm_calls": self.agent_budget.get("max_llm_calls", 12),
+                    "tool_calls": self.agent_budget.get("max_tool_calls", 24),
+                }) if self.review_pipeline == "bounded-v2" else {}),
+            ),
+            "coverage_receipts": [], "budget_gaps": [],
             "execution_context": dict(execution_context or {}),
             # Keep the coordinator-level pinned snapshot in the task-local
             # state as well.  Claim scanners and checkpoint fingerprints read
@@ -546,11 +596,18 @@ class MultiAgentCoordinator(Reviewer):
                 head = str(getattr(state["snapshot_provider"], "ref", ""))
                 if head:
                     state["source_sha"] = head
-        nodes = [
-            RuntimeNode("planner", self._plan_node, checkpoint=False),
-            RuntimeNode("specialists", self._specialist_node, checkpoint=False),
-            RuntimeNode("cross_shard", self._cross_shard_node, checkpoint=False),
-        ]
+        nodes = [RuntimeNode("planner", self._plan_node, checkpoint=False)]
+        if self.review_pipeline == "bounded-v2" and self.review_mode == "adaptive_multi_agent":
+            nodes.extend([
+                RuntimeNode("investigation", self._investigation_node, checkpoint=False),
+                RuntimeNode("coverage_repair", self._coverage_repair_node, checkpoint=False),
+            ])
+        else:
+            nodes.extend([
+                RuntimeNode("specialists", self._specialist_node, checkpoint=False),
+                RuntimeNode("coverage_repair", self._coverage_repair_node, checkpoint=False),
+                RuntimeNode("cross_shard", self._cross_shard_node, checkpoint=False),
+            ])
         if self.review_mode == "legacy":
             nodes.extend([
                 RuntimeNode("deliberation", self._deliberation_node, checkpoint=False),
@@ -559,11 +616,21 @@ class MultiAgentCoordinator(Reviewer):
                 RuntimeNode("arbiter", self._arbitrate_node, checkpoint=False),
             ])
         else:
-            nodes.extend([
-                RuntimeNode("claims", self._claim_node, checkpoint=False),
-                RuntimeNode("challenge", self._challenge_node, checkpoint=False),
-                RuntimeNode("decision", self._adaptive_decision_node, checkpoint=False),
-            ])
+            if self.review_pipeline == "bounded-v2":
+                nodes.extend([
+                    RuntimeNode("claims", self._claim_node, checkpoint=False),
+                    RuntimeNode("verifier", self._challenge_node, checkpoint=False),
+                    RuntimeNode("auditor", self._auditor_node, checkpoint=False),
+                    RuntimeNode("reclaim", self._claim_node, checkpoint=False),
+                    RuntimeNode("reverify", self._challenge_node, checkpoint=False),
+                    RuntimeNode("decision", self._adaptive_decision_node, checkpoint=False),
+                ])
+            else:
+                nodes.extend([
+                    RuntimeNode("claims", self._claim_node, checkpoint=False),
+                    RuntimeNode("challenge", self._challenge_node, checkpoint=False),
+                    RuntimeNode("decision", self._adaptive_decision_node, checkpoint=False),
+                ])
         result = self.runtime.execute(
             state,
             nodes,
@@ -696,7 +763,10 @@ class MultiAgentCoordinator(Reviewer):
                     if getattr(item, "execution_kind", "deterministic-checker") != "agent"]
         active_agents = [item for item in self.agents
                          if getattr(item, "execution_kind", "") == "agent"
-                         and getattr(item, "agent_role", "primary") != "challenger"]
+                         # Verifiers only falsify supplied claims; auditors
+                         # only look for omissions after verification. Neither
+                         # belongs in the initial specialist fan-out.
+                         and getattr(item, "agent_role", "primary") not in {"auditor", "verifier"}]
         preview = []
         for scanner in scanners:
             try:
@@ -719,11 +789,18 @@ class MultiAgentCoordinator(Reviewer):
         elif self.review_mode == "single_agent":
             active_agents = [item for item in active_agents
                              if getattr(item, "agent_role", "primary") == "primary"][:1]
-        else:
+        elif self.review_pipeline == "classic":
             active_agents = [item for item in active_agents if (
                 getattr(item, "agent_role", "primary") == "primary"
                 or getattr(item, "agent_role", "") in activated
             )]
+        else:
+            # Coverage is role-based, not risk-score-based. Risk priorities
+            # only order exploration inside a shard.
+            required_roles = {"primary", "security", "reliability"}
+            active_agents = [item for item in active_agents
+                             if getattr(item, "agent_role", "") in required_roles]
+            activated.update(getattr(item, "agent_role", "") for item in active_agents)
         shards = self._review_shards(state)
         selected = scanners + active_agents
         assignments = []
@@ -744,16 +821,32 @@ class MultiAgentCoordinator(Reviewer):
                     reason="coverage-owner" if index == 0 else "risk-domain-second-opinion",
                     shard_id=shard.shard_id, shard_files=list(shard.files),
                     coverage_scope="full-pr" if len(shards) == 1 else "shard",
+                    budget=self.budget_policy.for_shard(shard.changed_lines).to_dict(),
+                    required_hunk_ids=[item.hunk_id for item in shard.risk_hunks],
+                    priority_hunks=[item.to_dict() for item in sorted(
+                        shard.risk_hunks, key=lambda item: (-item.score, item.path, item.start_line)
+                    )],
                 ))
         planned_metadata = self.planner.plan(state["parsed"], selected)
         plan = ReviewPlan(
             languages=planned_metadata.languages,
             changed_files=list(state["parsed"].files),
             risk_level=planned_metadata.risk_level, assignments=assignments,
+            audit_rounds=self.budget_policy.REVERSE_AUDIT_ROUNDS,
+            dry_round_limit=self.budget_policy.REVERSE_AUDIT_DRY_ROUNDS,
         )
         for assignment in assignments:
             self._emit(state, self.planner.name, assignment.agent, "assignment",
                        assignment.to_dict(), assignment.assignment_id)
+        missing_roles = ({"primary", "security", "reliability"} - {
+            getattr(item, "agent_role", "") for item in active_agents
+        }) if (self.review_mode == "adaptive_multi_agent"
+               and self.review_pipeline == "bounded-v2") else set()
+        if missing_roles:
+            state.setdefault("coverage_gaps", []).append({
+                "reason": "required specialists unavailable", "files": list(state["parsed"].files),
+                "roles": sorted(missing_roles),
+            })
         return {
             "plan": plan, "assignments_by_agent": {item.agent: item for item in assignments},
             "shards": shards, "shards_by_id": {item.shard_id: item for item in shards},
@@ -791,11 +884,11 @@ class MultiAgentCoordinator(Reviewer):
 
     def _agent_tools(
         self, state: CollaborationState, assignment: ReviewAssignment,
-        cross_shard: bool = False,
+        cross_shard: bool = False, local_diff_override: str = "",
     ) -> ToolRegistry:
         shard = (state.get("shards_by_id") or {}).get(assignment.shard_id)
-        local_diff = shard.diff if shard else state["diff"]
-        local_parsed = shard.parsed if shard else state["parsed"]
+        local_diff = local_diff_override or (state["diff"] if cross_shard else (shard.diff if shard else state["diff"]))
+        local_parsed = state["parsed"] if cross_shard else (shard.parsed if shard else state["parsed"])
         retrieval = RepositoryRetrieval(state.get("snapshot_provider") or self.snapshot_provider, local_diff)
         def search_diff(query: str, limit: int = 20):
             value = str(query).strip().lower()
@@ -914,9 +1007,9 @@ class MultiAgentCoordinator(Reviewer):
             AgentTool("find_references", "Find references to a symbol in the authorized repository snapshot.",
                 {"type": "object", "properties": {"symbol": {"type": "string"}, "cursor": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, "required": ["symbol"], "additionalProperties": False}, lambda symbol, cursor=0, limit=20: retrieval.find_references(symbol, cursor, limit), lambda value, limit: reduce_tool_result("find_references", value, limit)),
         ]
-        if assignment.reason == "blind-challenge":
+        if assignment.reason in {"blind-challenge", "verify-findings"}:
             # The normalized claims already contain changed-line locators.
-            # A Challenger must gather independent snapshot evidence rather
+            # A verifier must gather independent snapshot evidence rather
             # than spending its stage budget rereading the diff.
             locator_only = {"recall_memory", "search_diff", "changed_line", "read_diff"}
             tool_values = [item for item in tool_values if item.name not in locator_only]
@@ -929,11 +1022,24 @@ class MultiAgentCoordinator(Reviewer):
         assignment: ReviewAssignment, feedback: Optional[List[str]],
         prior_execution: Optional[dict] = None,
     ) -> tuple:
-        blind = getattr(agent, "agent_role", "") == "challenger"
+        blind = getattr(agent, "agent_role", "") in {"auditor", "verifier"}
+        guidance = list(feedback or [])
+        if assignment.priority_hunks:
+            guidance.append(
+                "Shard coverage is required. Explore these hunk summaries first, then cover every "
+                "required_hunk_id: %s" % json.dumps(assignment.priority_hunks, ensure_ascii=False)
+            )
         memories = [] if blind else self._recall_memories(state, assignment)
         shard = (state.get("shards_by_id") or {}).get(assignment.shard_id)
-        local_diff = shard.diff if shard else state["diff"]
-        local_parsed = shard.parsed if shard else state["parsed"]
+        cross_shard = assignment.reason == "cross-shard"
+        local_diff = "" if cross_shard else (shard.diff if shard else state["diff"])
+        if assignment.reason == "coverage-repair" and shard and assignment.required_hunk_ids:
+            local_diff = DiffRiskScanner().select(
+                shard.diff, assignment.required_hunk_ids, assignment.shard_id,
+            ) or local_diff
+        local_parsed = state["parsed"] if cross_shard else (shard.parsed if shard else state["parsed"])
+        if assignment.reason == "coverage-repair" and local_diff:
+            local_parsed = parse_unified_diff(local_diff)
         bundle = self.context_manager.build(local_diff, assignment.to_dict(), memories)
         if bundle.omitted_files:
             state["coverage_gaps"].append({
@@ -945,7 +1051,9 @@ class MultiAgentCoordinator(Reviewer):
             state, "context-manager", agent.name, "context_prepared",
             bundle.metadata(), assignment.assignment_id,
         )
-        tools = self._agent_tools(state, assignment)
+        tools = self._agent_tools(
+            state, assignment, cross_shard=cross_shard, local_diff_override=local_diff,
+        )
         working_state = {
             "confirmed_evidence": [], "rejected_hypotheses": [], "open_questions": [],
             "files_inspected": [], "pending_files": list(assignment.files), "candidate_findings": [],
@@ -976,7 +1084,7 @@ class MultiAgentCoordinator(Reviewer):
             "task_id": state.get("task_id", ""),
             "diff": local_diff, "context": bundle.text,
             "context_metadata": bundle.metadata(), "parsed": local_parsed,
-            "assignment": assignment.to_dict(), "feedback": list(feedback or []),
+            "assignment": assignment.to_dict(), "feedback": guidance,
             "inbox": [] if blind else self._bus(state).inbox(agent.name, assignment.assignment_id),
             "memories": memories, "available_tools": tools.catalog(),
             "pr_map": state["pr_map"].compact(),
@@ -987,7 +1095,7 @@ class MultiAgentCoordinator(Reviewer):
                 "task": state.get("task_id", ""), "assignment": assignment.assignment_id,
                 "agent": agent.name, "snapshot": state.get("source_sha", ""),
             })[:24],
-            "cross_shard": assignment.reason == "cross-shard",
+            "cross_shard": cross_shard,
         }
         last_context = {"metadata": bundle.metadata()}
         observed_events: List[Dict[str, Any]] = []
@@ -1004,7 +1112,7 @@ class MultiAgentCoordinator(Reviewer):
             context_assignment = assignment.to_dict()
             context_assignment["pr_map"] = state["pr_map"].compact()
             managed = self.context_manager.compose(
-                bundle, context_assignment, feedback=list(feedback or []),
+                bundle, context_assignment, feedback=guidance,
                 inbox=loop_iteration.get("inbox") or [], memories=memories,
                 observations=loop_iteration.get("observations") or [],
                 tools=tools.catalog(), loop_context=loop_iteration.get("loop_context") or {},
@@ -1032,6 +1140,7 @@ class MultiAgentCoordinator(Reviewer):
             }
             estimated = managed.estimated_tokens
             budget = state["shared_budget"]
+            budgeted_model = getattr(agent, "execution_kind", "") == "agent"
             remaining_output = budget.remaining("output_tokens")
             if remaining_output <= 0:
                 raise RuntimeBudgetExceeded("shared output token budget exceeded")
@@ -1042,7 +1151,7 @@ class MultiAgentCoordinator(Reviewer):
                 1, min(remaining_output, per_request_output)
             )
             stage_limit = int((state.get("execution_context") or {}).get(
-                "stage_max_llm_calls", 0
+                "stage_max_llm_calls", assignment.budget.get("max_loop_calls", 0)
             ) or 0)
             requests_remaining = max(0, stage_limit - usage_totals["llm_calls"]) if stage_limit else 0
             prepared["llm_requests_remaining"] = requests_remaining
@@ -1051,7 +1160,12 @@ class MultiAgentCoordinator(Reviewer):
             prepared["must_return_final"] = bool(stage_limit and requests_remaining <= 2)
             if stage_limit and usage_totals["llm_calls"] >= stage_limit:
                 raise RuntimeBudgetExceeded("agent stage LLM request budget exceeded")
-            if not budget.reserve("llm_calls", 1) or not budget.reserve("input_tokens", estimated):
+            stage = "review" if assignment.reason in {
+                "initial-plan", "coverage-owner", "risk-domain-second-opinion", "coverage-repair",
+                "cross-shard",
+            } else "tail"
+            if budgeted_model and (not budget.reserve("llm_calls", 1, stage=stage)
+                                  or not budget.reserve("input_tokens", estimated, stage=stage)):
                 raise RuntimeBudgetExceeded("shared agent budget exceeded")
             configured_timeout = int(getattr(agent, "timeout", 60) or 60)
             prepared["_request_timeout_seconds"] = (
@@ -1092,7 +1206,9 @@ class MultiAgentCoordinator(Reviewer):
                 raise
             if isinstance(action, dict):
                 if str(action.get("action", "")).lower() == "tool":
-                    if not budget.reserve("tool_calls", 1):
+                    tool_limit = int(assignment.budget.get("tool_budget", 0) or 0)
+                    if ((tool_limit and usage_totals["tool_calls"] >= tool_limit)
+                            or (budgeted_model and not budget.reserve("tool_calls", 1, stage=stage))):
                         raise RuntimeBudgetExceeded("shared tool-call budget exceeded")
                     usage_totals["tool_calls"] += 1
                 usage = dict(action.get("_usage") or {})
@@ -1103,7 +1219,7 @@ class MultiAgentCoordinator(Reviewer):
                 )
                 if len(request_attempts) > 1:
                     for _ in request_attempts[1:]:
-                        if not budget.reserve("llm_calls", 1):
+                        if budgeted_model and not budget.reserve("llm_calls", 1, stage=stage):
                             raise RuntimeBudgetExceeded("shared LLM request budget exceeded after model fallback")
                 for request_attempt in request_attempts:
                     usage_totals["request_attempts"].append(dict(request_attempt))
@@ -1122,9 +1238,10 @@ class MultiAgentCoordinator(Reviewer):
                 if not actual_input:
                     actual_input = estimated
                     usage["usage_source"] = "estimated"
-                budget.replace_estimate("input_tokens", estimated, actual_input)
+                if budgeted_model:
+                    budget.replace_estimate("input_tokens", estimated, actual_input)
                 output_tokens = int(usage.get("output_tokens", 0) or 0)
-                if output_tokens and not budget.reserve("output_tokens", output_tokens):
+                if budgeted_model and output_tokens and not budget.reserve("output_tokens", output_tokens):
                     raise RuntimeBudgetExceeded("shared output token budget exceeded")
                 usage_totals["llm_calls"] += max(1, len(request_attempts))
                 if not action.get("_physical_request_replayed"):
@@ -1149,7 +1266,15 @@ class MultiAgentCoordinator(Reviewer):
                 observed_events.append(dict(detail))
 
         try:
-            result = self.agent_loop.run(
+            local_loop = AgentLoop(
+                max_steps=int(assignment.budget.get("max_steps", self.agent_loop.max_steps)),
+                timeout_seconds=self.agent_loop.timeout_seconds,
+                active_rounds=self.agent_loop.active_rounds,
+                soft_compact_ratio=self.agent_loop.soft_compact_ratio,
+                hard_compact_ratio=self.agent_loop.hard_compact_ratio,
+                context_budget=self.agent_loop.context_budget,
+            )
+            result = local_loop.run(
                 managed_step, tools, loop_state, traced_event,
             )
         except Exception as exc:
@@ -1167,7 +1292,9 @@ class MultiAgentCoordinator(Reviewer):
             }
             raise
         findings = list(result.output or [])
-        expected_findings = assignment.reason not in {"blind-challenge", "challenge-requested-revision"}
+        expected_findings = assignment.reason not in {
+            "blind-challenge", "verify-findings", "challenge-requested-revision",
+        }
         if expected_findings and not all(isinstance(item, Finding) for item in findings):
             raise TypeError("agent loop final output must contain Finding objects")
         if not expected_findings and not all(isinstance(item, dict) for item in findings):
@@ -1295,7 +1422,7 @@ class MultiAgentCoordinator(Reviewer):
         failed_role = str(getattr(failed_agent, "agent_role", ""))
         values = [
             item for item in self.agents if item is not failed_agent
-            and getattr(item, "agent_role", "") != "challenger"
+            and getattr(item, "agent_role", "") != "auditor"
             and (not failed_role or getattr(item, "agent_role", "") == failed_role)
         ]
         if failed_role in {"", "primary"} and all(
@@ -1306,22 +1433,28 @@ class MultiAgentCoordinator(Reviewer):
 
     def _run_assignment(
         self, state: CollaborationState, assignment: ReviewAssignment,
-        agent: Reviewer,
+        agent: Reviewer, feedback: Optional[List[str]] = None,
     ) -> dict:
         checkpoint = self._restore_assignment_checkpoint(state, assignment, agent)
         if checkpoint is not None:
             return checkpoint
+        stage = "review" if assignment.reason in {
+            "initial-plan", "coverage-owner", "risk-domain-second-opinion", "coverage-repair",
+            "cross-shard",
+        } else "tail"
         if (getattr(agent, "execution_kind", "") == "agent"
-                and not state["shared_budget"].reserve("agent_runs", 1)):
+                and not state["shared_budget"].reserve("agent_runs", 1, stage=stage)):
+            receipt = self._coverage_receipt(assignment, "budget-exhausted", ["global budget/tail reserve"])
             return {
                 "agent": agent.name, "assignment_id": assignment.assignment_id,
                 "attempts": 0, "status": "budget_exhausted", "findings": [],
                 "error": "shared agent run budget exceeded", "substituted_for": "",
                 "assignment": assignment,
                 "execution": {"loop_steps": 0, "loop_stop_reason": "shared-budget"},
+                "coverage_receipt": receipt,
             }
         findings, attempts, error, execution = self._invoke_agent(
-            state, agent, assignment
+            state, agent, assignment, feedback
         )
         result = {
             "agent": agent.name, "assignment_id": assignment.assignment_id,
@@ -1330,6 +1463,10 @@ class MultiAgentCoordinator(Reviewer):
             ),
             "findings": findings, "error": error, "substituted_for": "",
             "assignment": assignment, "execution": execution,
+            "coverage_receipt": self._coverage_receipt(
+                assignment, "complete" if not error else "budget-exhausted" if "budget" in error.lower() else "partial",
+                [error] if error else [], execution,
+            ),
         }
         if not error:
             self._save_assignment_checkpoint(state, result)
@@ -1342,6 +1479,10 @@ class MultiAgentCoordinator(Reviewer):
         if "budget" in error.lower():
             # A hard budget is terminal for this assignment. Handing it to a
             # substitute would hide the failed semantic run and overspend.
+            return result
+        if assignment.reason == "coverage-repair":
+            # A repair is deliberately scoped to the original agent's missing
+            # hunks; a general fallback would falsely broaden that coverage.
             return result
         replacement = self.planner.replan(
             assignment, self._replacement_candidates(agent), error
@@ -1372,7 +1513,53 @@ class MultiAgentCoordinator(Reviewer):
             "findings": findings, "error": replacement_error,
             "substituted_for": agent.name,
             "assignment": replacement, "execution": replacement_execution,
+            "coverage_receipt": self._coverage_receipt(
+                replacement, "complete" if not replacement_error else "partial",
+                [replacement_error] if replacement_error else [], replacement_execution,
+            ),
         }
+
+    @staticmethod
+    def _coverage_receipt(
+        assignment: ReviewAssignment, status: str, gaps: List[str] = None, execution: dict = None,
+    ) -> dict:
+        execution = execution or {}
+        inspected = {
+            str((item.get("locator") or {}).get("path", ""))
+            for item in execution.get("observations", []) if item.get("ok")
+        }
+        # Reading the assigned diff is coverage even if no repository snapshot
+        # was supplied; a budget-exhausted assignment remains explicitly open.
+        covered = list(assignment.files) if status == "complete" else sorted(inspected.intersection(assignment.files))
+        uncovered = sorted(set(assignment.files).difference(covered))
+        required_hunks = list(assignment.required_hunk_ids)
+        priority_by_id = {
+            str(item.get("hunk_id", "")): item for item in assignment.priority_hunks
+            if isinstance(item, dict) and item.get("hunk_id")
+        }
+        covered_hunks = list(required_hunks) if status == "complete" else []
+        if status != "complete":
+            for hunk_id in required_hunks:
+                hunk = priority_by_id.get(hunk_id, {})
+                for observation in execution.get("observations", []):
+                    locator = observation.get("locator") or {}
+                    if not observation.get("ok") or locator.get("path") != hunk.get("path"):
+                        continue
+                    start = int(locator.get("start_line", locator.get("line", 0)) or 0)
+                    end = int(locator.get("end_line", locator.get("line", start)) or start)
+                    if start and start <= int(hunk.get("end_line", 0)) and end >= int(hunk.get("start_line", 0)):
+                        covered_hunks.append(hunk_id)
+                        break
+        covered_hunks = sorted(set(covered_hunks))
+        uncovered_hunks = [item for item in required_hunks if item not in set(covered_hunks)]
+        return CoverageReceipt(
+            assignment_id=assignment.assignment_id, shard_id=assignment.shard_id,
+            covered_files=covered, uncovered_files=uncovered,
+            required_hunks=required_hunks, covered_hunks=covered_hunks,
+            uncovered_hunks=uncovered_hunks,
+            open_questions=list((execution.get("loop_context") or {}).get("open_questions", []))[:8],
+            budget_gaps=[item for item in (gaps or []) if item], status=status,
+        ).to_dict()
 
     def _assignment_fingerprint(
         self, state: CollaborationState, assignment: ReviewAssignment, agent: Reviewer,
@@ -1411,6 +1598,9 @@ class MultiAgentCoordinator(Reviewer):
             "attempts": int(saved.get("attempts", 1)), "status": "completed",
             "findings": findings, "error": "", "substituted_for": "",
             "assignment": assignment, "execution": dict(saved.get("execution") or {}),
+            "coverage_receipt": self._coverage_receipt(
+                assignment, "complete", execution=dict(saved.get("execution") or {}),
+            ),
             "checkpoint_restored": True,
         }
 
@@ -1434,13 +1624,15 @@ class MultiAgentCoordinator(Reviewer):
             claim_token=str(context.get("claim_token", "")),
         )
 
-    def _specialist_node(self, state: CollaborationState) -> Dict[str, Any]:
+    def _specialist_node(
+        self, state: CollaborationState, worker_limit: int = None,
+    ) -> Dict[str, Any]:
         outcomes = []
         by_name = {item.name: item for item in self.agents}
         by_name.setdefault(self.fallback_agent.name, self.fallback_agent)
         assignments = state["plan"].assignments
         with ThreadPoolExecutor(
-            max_workers=min(self.max_workers, max(1, len(assignments)))
+            max_workers=min(worker_limit or self.max_workers, max(1, len(assignments)))
         ) as pool:
             futures = {
                 pool.submit(self._run_assignment, state, assignment, by_name[assignment.agent]): assignment
@@ -1452,6 +1644,12 @@ class MultiAgentCoordinator(Reviewer):
         sources: Dict[str, List[str]] = {}
         assignment_map = {item.assignment_id: item for item in state["plan"].assignments}
         for outcome in outcomes:
+            receipt = outcome.get("coverage_receipt")
+            if receipt:
+                state.setdefault("coverage_receipts", []).append(receipt)
+                if (receipt.get("budget_gaps") or receipt.get("uncovered_files")
+                        or receipt.get("uncovered_hunks")):
+                    state.setdefault("budget_gaps", []).append(receipt)
             owner_assignment = assignment_map.get(outcome["assignment_id"], outcome["assignment"])
             # Tool evidence must exist before an LLM's stable evidence_refs
             # can be linked to its proposed findings.
@@ -1464,7 +1662,8 @@ class MultiAgentCoordinator(Reviewer):
                 sources.setdefault(key, []).append(outcome["assignment_id"])
                 findings.append(finding)
             if (outcome["status"] not in {"completed", "fallback"}
-                    and owner_assignment.reason == "coverage-owner"):
+                    and owner_assignment.reason == "coverage-owner"
+                    and self.review_pipeline == "classic"):
                 state["coverage_gaps"].append({
                     "assignment_id": outcome["assignment_id"],
                     "shard_id": owner_assignment.shard_id,
@@ -1478,6 +1677,163 @@ class MultiAgentCoordinator(Reviewer):
             "agent_outcomes": outcomes,
             "assignments_by_agent": assignment_map,
         }
+
+    def _coverage_repair_node(self, state: CollaborationState) -> Dict[str, Any]:
+        """Spend only review-stage headroom on hunk coverage left incomplete."""
+        if self.review_pipeline != "bounded-v2" or self.review_mode != "adaptive_multi_agent":
+            return {"coverage_repair_outcomes": []}
+        by_name = {item.name: item for item in self.agents}
+        original_outcomes = list(state.get("agent_outcomes", []))
+        repairs = []
+        for outcome in original_outcomes:
+            receipt = outcome.get("coverage_receipt") or {}
+            missing = list(receipt.get("uncovered_hunks") or [])
+            assignment = outcome.get("assignment")
+            agent = by_name.get(getattr(assignment, "agent", ""))
+            if not missing or assignment is None or agent is None:
+                continue
+            priorities = [item for item in assignment.priority_hunks
+                          if item.get("hunk_id") in set(missing)]
+            repairs.append((
+                replace(
+                    assignment, assignment_id=assignment.assignment_id + ".coverage-repair",
+                    reason="coverage-repair", round=assignment.round + 1,
+                    required_hunk_ids=missing, priority_hunks=priorities,
+                ),
+                agent,
+            ))
+        if not repairs:
+            return {"coverage_repair_outcomes": []}
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(repairs))) as pool:
+            futures = [pool.submit(
+                self._run_assignment, state, assignment, agent,
+                ["Re-review only these previously uncovered hunk IDs: %s" % assignment.required_hunk_ids],
+            ) for assignment, agent in repairs]
+            outcomes = [future.result() for future in futures]
+
+        findings = list(state.get("specialist_findings", []))
+        sources = {key: list(value) for key, value in (state.get("finding_sources") or {}).items()}
+        assignments = dict(state.get("assignments_by_agent") or {})
+        for outcome in outcomes:
+            assignment = outcome["assignment"]
+            assignments[outcome["assignment_id"]] = assignment
+            receipt = outcome.get("coverage_receipt") or {}
+            if receipt:
+                state.setdefault("coverage_receipts", []).append(receipt)
+                if receipt.get("budget_gaps") or receipt.get("uncovered_hunks"):
+                    state.setdefault("budget_gaps", []).append(receipt)
+            state["evidence_ledger"].record((outcome.get("execution") or {}).get("pinned_evidence", []))
+            for finding in outcome.get("findings", []):
+                key = finding_key(finding)
+                if any(finding_key(existing) == key for existing in findings):
+                    continue
+                finding.evidence_refs = state["evidence_ledger"].link(
+                    key, finding.evidence_refs, finding.path, finding.line,
+                )
+                findings.append(finding)
+                sources.setdefault(key, []).append(outcome["assignment_id"])
+            if receipt.get("uncovered_hunks"):
+                state.setdefault("coverage_gaps", []).append({
+                    "assignment_id": outcome["assignment_id"], "shard_id": assignment.shard_id,
+                    "files": list(assignment.files), "uncovered_hunks": list(receipt["uncovered_hunks"]),
+                    "reason": "required hunk coverage incomplete after repair",
+                    "error": str(outcome.get("error", ""))[:500],
+                })
+        return {
+            "specialist_findings": findings, "finding_sources": sources,
+            "agent_outcomes": original_outcomes + outcomes,
+            "assignments_by_agent": assignments, "coverage_repair_outcomes": outcomes,
+        }
+
+    def _run_cross_shard_seed(self, state: CollaborationState) -> Optional[dict]:
+        """Run the tracer from PR relations only, independently of specialists."""
+        if self.review_mode == "rules_only" or len(state.get("shards") or []) <= 1:
+            return None
+        agent = next((item for item in self.agents
+                      if callable(getattr(item, "agent_step", None))
+                      and getattr(item, "agent_role", "") == "cross_shard"), None)
+        if agent is None:
+            agent = next((item for item in self.agents
+                          if callable(getattr(item, "agent_step", None))
+                          and getattr(item, "agent_role", "") == "primary"), None)
+        if agent is None:
+            return None
+        relation_map = {
+            "symbols": {item.path: item.symbols for item in state["pr_map"].files if item.symbols},
+            "imports": {item.path: item.imports for item in state["pr_map"].files if item.imports},
+            "shards": [item.identity() for item in state.get("shards", [])],
+        }
+        assignment = ReviewAssignment(
+            agent=agent.name, objective=self.cross_shard_tracer.objective(),
+            files=list(state["parsed"].files), risk_domains=list(getattr(agent, "domains", ())),
+            assignment_id="cross-shard-tracer", reason="cross-shard", coverage_scope="cross-shard",
+            budget=self.budget_policy.for_shard(sum(item.changed_lines for item in state.get("shards", []))).to_dict(),
+        )
+        outcome = self._run_assignment(state, assignment, agent, [
+            "Structured PR relation seeds: %s" % json.dumps(relation_map, ensure_ascii=False, sort_keys=True),
+            "Trace only caller/callee, API, schema, and producer/consumer contract compatibility.",
+        ])
+        return {"agent": agent, "assignment": assignment, "outcome": outcome}
+
+    def _merge_cross_shard_seed(self, state: CollaborationState, seed: Optional[dict]) -> Dict[str, Any]:
+        if seed is None:
+            return {"cross_shard_findings": [], "cross_shard_execution": {}, "cross_shard_outcomes": []}
+        agent, assignment, outcome = seed["agent"], seed["assignment"], seed["outcome"]
+        execution = outcome.get("execution") or {}
+        findings = []
+        state.setdefault("assignments_by_agent", {})[assignment.assignment_id] = assignment
+        if outcome.get("coverage_receipt"):
+            state.setdefault("coverage_receipts", []).append(outcome["coverage_receipt"])
+        if outcome.get("status") not in {"completed", "fallback"}:
+            state.setdefault("coverage_gaps", []).append({
+                "shard_id": "cross-shard", "files": [], "reason": "cross-shard tracer incomplete",
+                "agent": agent.name, "error": str(outcome.get("error", ""))[:500],
+            })
+        else:
+            state["evidence_ledger"].record(execution.get("pinned_evidence", []))
+            for finding in outcome.get("findings", []):
+                finding.evidence_refs = state["evidence_ledger"].link(
+                    finding_key(finding), finding.evidence_refs, finding.path, finding.line,
+                )
+                findings.append(finding)
+                state.setdefault("finding_sources", {}).setdefault(finding_key(finding), []).append(assignment.assignment_id)
+        state.setdefault("specialist_findings", []).extend(findings)
+        self._emit(state, "context-orchestrator", "specialists", "cross_shard_review", {
+            "agents": [self.cross_shard_tracer.name], "findings": [item.to_dict() for item in findings],
+        })
+        return {
+            "cross_shard_findings": findings, "cross_shard_outcomes": [outcome],
+            "cross_shard_execution": {
+                "repo_tool_calls": int(execution.get("repo_tool_calls", 0)),
+                "retrieved_context_tokens": int(execution.get("retrieved_context_tokens", 0)),
+                "llm_calls": int((execution.get("usage") or {}).get("llm_calls", 0)),
+            },
+        }
+
+    def _investigation_node(self, state: CollaborationState) -> Dict[str, Any]:
+        """Fan out shard experts and the independent relation tracer together."""
+        if self.max_workers <= 1:
+            specialists = self._specialist_node(state)
+            state.update(specialists)
+            tracer = self._merge_cross_shard_seed(state, self._run_cross_shard_seed(state))
+        else:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                specialist_future = pool.submit(self._specialist_node, state, self.max_workers - 1)
+                tracer_future = pool.submit(self._run_cross_shard_seed, state)
+                specialists = specialist_future.result()
+                # Merge only after specialists are complete. The seed itself
+                # had no access to their findings or evidence.
+                state.update(specialists)
+                tracer = self._merge_cross_shard_seed(state, tracer_future.result())
+        # `_merge_cross_shard_seed` appends linked findings to the live state.
+        # Preserve that merged collection in the runtime-node result: otherwise
+        # the specialist snapshot would overwrite it when AgentRuntime applies
+        # this node's output.
+        merged = dict(specialists)
+        merged["specialist_findings"] = list(state.get("specialist_findings", []))
+        merged["finding_sources"] = dict(state.get("finding_sources", {}))
+        merged["assignments_by_agent"] = dict(state.get("assignments_by_agent", {}))
+        return {**merged, **tracer}
 
     def _legacy_cross_shard_node(self, state: CollaborationState) -> Dict[str, Any]:
         """Run a compact, bounded second pass without ever restoring the full Diff."""
@@ -1503,9 +1859,12 @@ class MultiAgentCoordinator(Reviewer):
         cross_calls = 0
         cross_bytes = 0
         cross_llm_calls = 0
+        activated = set(state.get("activated_domains") or [])
         for agent in self.agents:
             stepper = getattr(agent, "agent_step", None)
-            if not stepper or getattr(agent, "agent_role", "") == "challenger":
+            role = getattr(agent, "agent_role", "")
+            if (not stepper or role == "auditor"
+                    or (role not in {"", "primary"} and role not in activated)):
                 continue
             try:
                 text = json.dumps(summary, ensure_ascii=False, sort_keys=True)
@@ -1569,67 +1928,9 @@ class MultiAgentCoordinator(Reviewer):
         }}
 
     def _cross_shard_node(self, state: CollaborationState) -> Dict[str, Any]:
-        if self.review_mode == "rules_only" or len(state.get("shards") or []) <= 1:
-            return {"cross_shard_findings": [], "cross_shard_execution": {},
-                    "cross_shard_outcomes": []}
-        activated = set(state.get("activated_domains") or [])
-        selected = [
-            agent for agent in self.agents
-            if callable(getattr(agent, "agent_step", None))
-            and getattr(agent, "agent_role", "") != "challenger"
-            and (getattr(agent, "agent_role", "") in {"", "primary"}
-                 or getattr(agent, "agent_role", "") in activated)
-        ]
-        outcomes = []
-        findings = []
-        repo_calls = retrieved_tokens = llm_calls = 0
-        for agent in selected:
-            role = str(getattr(agent, "agent_role", "primary"))
-            assignment = ReviewAssignment(
-                agent=agent.name,
-                objective=("Check cross-shard API signatures, callers, schemas, configuration "
-                           "and data flow using the compact PR map and repository tools."),
-                files=list(state["parsed"].files),
-                risk_domains=list(getattr(agent, "domains", ())),
-                assignment_id="cross-shard-%s" % role, reason="cross-shard",
-                coverage_scope="cross-shard",
-            )
-            outcome = self._run_assignment(state, assignment, agent)
-            outcomes.append(outcome)
-            state.setdefault("assignments_by_agent", {})[assignment.assignment_id] = assignment
-            execution = outcome.get("execution") or {}
-            repo_calls += int(execution.get("repo_tool_calls", 0))
-            retrieved_tokens += int(execution.get("retrieved_context_tokens", 0))
-            llm_calls += int((execution.get("usage") or {}).get("llm_calls", 0))
-            if outcome.get("status") not in {"completed", "fallback"}:
-                state.setdefault("coverage_gaps", []).append({
-                    "shard_id": "cross-shard", "files": [],
-                    "reason": "cross-shard review failed", "agent": agent.name,
-                    "error": str(outcome.get("error", ""))[:500],
-                })
-                continue
-            state["evidence_ledger"].record(execution.get("pinned_evidence", []))
-            for finding in outcome.get("findings", []):
-                finding.evidence_refs = state["evidence_ledger"].link(
-                    finding_key(finding), finding.evidence_refs, finding.path, finding.line,
-                )
-                findings.append(finding)
-                state.setdefault("finding_sources", {}).setdefault(
-                    finding_key(finding), []
-                ).append(assignment.assignment_id)
-        state.setdefault("specialist_findings", []).extend(findings)
-        self._emit(state, "context-orchestrator", "specialists", "cross_shard_review", {
-            "activated_domains": sorted(activated),
-            "agents": [item.name for item in selected],
-            "findings": [item.to_dict() for item in findings],
-        })
-        return {
-            "cross_shard_findings": findings, "cross_shard_outcomes": outcomes,
-            "cross_shard_execution": {
-                "repo_tool_calls": repo_calls, "retrieved_context_tokens": retrieved_tokens,
-                "llm_calls": llm_calls,
-            },
-        }
+        if self.review_pipeline == "classic":
+            return self._legacy_cross_shard_node(state)
+        return self._merge_cross_shard_seed(state, self._run_cross_shard_seed(state))
 
     def _agent_by_name(self, name: str) -> Optional[Reviewer]:
         return next((item for item in self.agents if item.name == name), None)
@@ -1647,7 +1948,7 @@ class MultiAgentCoordinator(Reviewer):
             agent.name, role, provider, model, prompt_hash,
             ("read_file", "read_diff", "grep_repo", "find_symbol", "find_references")
             if getattr(agent, "execution_kind", "") == "agent" else (),
-            assignment_id, group, 0, role == "challenger",
+            assignment_id, group, 0, role == "auditor",
             model, provider, prompt_hash,
         )
 
@@ -1838,6 +2139,82 @@ class MultiAgentCoordinator(Reviewer):
             "claim_evidence": evidence_by_claim, "agent_runs": runs,
         }
 
+    def _auditor_node(self, state: CollaborationState) -> Dict[str, Any]:
+        return self.auditor_stage.run(self, state)
+
+    def _run_shard_audits(
+        self, state: CollaborationState, stop_policy: AuditStopPolicy,
+    ) -> Dict[str, Any]:
+        """Reverse-audit each original shard in parallel, rounds serially."""
+        if self.review_mode == "rules_only":
+            return {"audit_outcomes": [], "audit_rounds": []}
+        auditor = next((item for item in self.agents
+                        if getattr(item, "agent_role", "") == "auditor"
+                        and callable(getattr(item, "agent_step", None))), None)
+        if auditor is None:
+            return {"audit_outcomes": [], "audit_rounds": []}
+        cumulative = [state["claim_findings"][claim.claim_id].to_dict()
+                      for claim in state.get("claims", []) if claim.claim_id in state.get("claim_findings", {})]
+        all_outcomes, round_summaries, dry_rounds = [], [], 0
+        max_rounds = int(getattr(state.get("plan"), "audit_rounds", stop_policy.max_rounds))
+        dry_limit = int(getattr(state.get("plan"), "dry_round_limit", stop_policy.consecutive_dry_rounds))
+        for round_number in range(1, max_rounds + 1):
+            deadline = float(state.get("deadline_monotonic", 0) or 0)
+            if deadline and time.monotonic() >= deadline:
+                state.setdefault("coverage_gaps", []).append({"reason": "auditor deadline gate", "files": []})
+                break
+            assignments = [ReviewAssignment(
+                agent=auditor.name,
+                objective="Find defects missed by prior review in this shard only; do not repeat confirmed findings.",
+                files=list(shard.files), risk_domains=list(getattr(auditor, "domains", ())),
+                assignment_id="audit-%s-r%d" % (shard.shard_id, round_number), round=round_number,
+                reason="reverse-audit", shard_id=shard.shard_id, shard_files=list(shard.files),
+                coverage_scope="shard", budget=self.budget_policy.for_shard(shard.changed_lines).to_dict(),
+            ) for shard in state.get("shards", [])]
+            if not assignments:
+                break
+            guidance = ["Confirmed findings (do not duplicate): %s" % json.dumps(cumulative, ensure_ascii=False)]
+            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(assignments))) as pool:
+                futures = [pool.submit(self._run_assignment, state, assignment, auditor, guidance)
+                           for assignment in assignments]
+                outcomes = [future.result() for future in futures]
+            all_outcomes.extend(outcomes)
+            new_findings = []
+            complete = True
+            for outcome in outcomes:
+                state.setdefault("assignments_by_agent", {})[outcome["assignment_id"]] = outcome["assignment"]
+                receipt = outcome.get("coverage_receipt")
+                if receipt:
+                    state.setdefault("coverage_receipts", []).append(receipt)
+                if outcome.get("status") not in {"completed", "fallback"}:
+                    complete = False
+                    state.setdefault("coverage_gaps", []).append({
+                        "assignment_id": outcome["assignment_id"], "shard_id": outcome["assignment"].shard_id,
+                        "files": list(outcome["assignment"].files), "reason": "reverse audit incomplete",
+                    })
+                    continue
+                execution = outcome.get("execution") or {}
+                state["evidence_ledger"].record(execution.get("pinned_evidence", []))
+                for finding in outcome.get("findings", []):
+                    key = finding_key(finding)
+                    if any(finding_key(existing) == key for existing in state.get("specialist_findings", []) + new_findings):
+                        continue
+                    finding.evidence_refs = state["evidence_ledger"].link(key, finding.evidence_refs, finding.path, finding.line)
+                    new_findings.append(finding)
+                    state.setdefault("finding_sources", {}).setdefault(key, []).append(outcome["assignment_id"])
+            state.setdefault("specialist_findings", []).extend(new_findings)
+            cumulative.extend(item.to_dict() for item in new_findings)
+            dry = complete and not new_findings
+            dry_rounds = dry_rounds + 1 if dry else 0
+            round_summaries.append({"round": round_number, "new_findings": len(new_findings),
+                                    "dry": dry, "outcomes": len(outcomes)})
+            if stop_policy.should_stop(round_number, dry_rounds) or dry_rounds >= dry_limit:
+                break
+        if round_summaries and len(round_summaries) >= max_rounds and dry_rounds < dry_limit:
+            state.setdefault("coverage_gaps", []).append({"reason": "reverse audit hard round cap", "files": []})
+        state.setdefault("agent_outcomes", []).extend(all_outcomes)
+        return {"audit_outcomes": all_outcomes, "audit_rounds": round_summaries}
+
     def _legacy_adaptive_challenge_node(self, state: CollaborationState) -> Dict[str, Any]:
         if self.review_mode == "rules_only":
             return {"challenges": [], "challenge_outcomes": []}
@@ -1859,17 +2236,17 @@ class MultiAgentCoordinator(Reviewer):
             return {"challenges": [], "challenge_outcomes": []}
         primary = next((item for item in self.agents
                         if getattr(item, "agent_role", "") == "primary"), None)
-        challenger = (
+        auditor = (
             primary if self.challenge_strategy == "self_reflect" else
             next((item for item in self.agents
-                  if getattr(item, "agent_role", "") == "challenger"), None)
+                  if getattr(item, "agent_role", "") == "auditor"), None)
         )
-        if challenger is None:
+        if auditor is None:
             return {"challenges": [], "challenge_outcomes": []}
-        if (self.challenge_strategy == "independent_challenger"
+        if (self.challenge_strategy == "independent_auditor"
                 and not state["shared_budget"].reserve("agent_runs", 1)):
             return {"challenges": [], "challenge_outcomes": [{
-                "status": "budget_exhausted", "agent": challenger.name,
+                "status": "budget_exhausted", "agent": auditor.name,
             }]}
         blind_claims = []
         for claim in sorted(state.get("claims", []), key=lambda item: item.claim_id):
@@ -1877,7 +2254,7 @@ class MultiAgentCoordinator(Reviewer):
             value.pop("proposer_run_id", None)
             blind_claims.append(value)
         assignment = ReviewAssignment(
-            agent=challenger.name,
+            agent=auditor.name,
             objective="Blindly verify or refute candidate claims and find at most one missed high-risk defect.",
             files=list(state["parsed"].files), risk_domains=["security", "reliability", "correctness"],
             assignment_id="challenge-" + artifact_fingerprint({
@@ -1893,14 +2270,14 @@ class MultiAgentCoordinator(Reviewer):
         if self.challenge_strategy == "self_reflect":
             prior_execution = next((
                 item.get("execution") for item in state.get("agent_outcomes", [])
-                if item.get("agent") == challenger.name
+                if item.get("agent") == auditor.name
             ), None)
         findings, attempts, error, execution = self._invoke_agent(
-            state, challenger, assignment, guidance, prior_execution,
+            state, auditor, assignment, guidance, prior_execution,
         )
         challenge_run_id = artifact_fingerprint({
             "task": state.get("task_id", ""), "assignment": assignment.assignment_id,
-            "agent": challenger.name, "snapshot": state.get("source_sha", ""),
+            "agent": auditor.name, "snapshot": state.get("source_sha", ""),
         })[:24]
         if self.challenge_strategy == "self_reflect":
             primary_run = next((item for item in state.get("agent_runs", [])
@@ -1917,7 +2294,7 @@ class MultiAgentCoordinator(Reviewer):
                 "tool": observation.get("tool", ""),
                 "path": locator.get("path", ""),
                 "line": locator.get("line", locator.get("start_line", 0)),
-                "result": result, "agent": challenger.name, "shard_id": "challenge",
+                "result": result, "agent": auditor.name, "shard_id": "challenge",
             }
             raw_evidence.append(record)
         evidence = [evidence_from_record(
@@ -1950,12 +2327,12 @@ class MultiAgentCoordinator(Reviewer):
             state["claim_findings"][claim.claim_id] = finding
             state.setdefault("claim_evidence", {})[claim.claim_id] = list(evidence)
             challenges.append(Challenge(
-                claim.claim_id, "new_claim", "Challenger found a previously omitted claim.",
+                claim.claim_id, "new_claim", "Auditor found a previously omitted claim.",
                 challenge_run_id, tuple(item.evidence_id for item in evidence),
             ))
         revision = {}
         revision_run = None
-        if (self.challenge_strategy == "independent_challenger" and primary
+        if (self.challenge_strategy == "independent_auditor" and primary
                 and any(item.verdict in {"refute", "insufficient", "new_claim"} for item in challenges)):
             revision_assignment = ReviewAssignment(
                 agent=primary.name,
@@ -2000,7 +2377,7 @@ class MultiAgentCoordinator(Reviewer):
             )
         usage = execution.get("usage") or {}
         challenge_run = AgentRun(
-            challenge_run_id, self._agent_spec(challenger, assignment.assignment_id),
+            challenge_run_id, self._agent_spec(auditor, assignment.assignment_id),
             assignment.assignment_id, state.get("source_sha", ""),
             "completed" if not error else "failed",
             tuple(item.claim_id for item in challenges), int(execution.get("tool_calls", 0)),
@@ -2010,7 +2387,7 @@ class MultiAgentCoordinator(Reviewer):
             *self._request_trace(execution),
         )
         runs = list(state.get("agent_runs", []))
-        if self.challenge_strategy == "independent_challenger":
+        if self.challenge_strategy == "independent_auditor":
             runs.append(challenge_run)
         else:
             for index, run in enumerate(runs):
@@ -2052,7 +2429,7 @@ class MultiAgentCoordinator(Reviewer):
                     )
                     break
         outcomes = [{
-            "agent": challenger.name, "status": "completed" if not error else "failed",
+            "agent": auditor.name, "status": "completed" if not error else "failed",
             "attempts": attempts, "error": error, "execution": execution,
             "blind_context": True,
         }]
@@ -2065,6 +2442,13 @@ class MultiAgentCoordinator(Reviewer):
         }
 
     def _challenge_node(self, state: CollaborationState) -> Dict[str, Any]:
+        # Verification is deliberately a fan-out: each worker receives at
+        # most eight normalized findings and independently re-collects proof.
+        # The older monolithic challenge implementation remains below for
+        # compatibility with legacy callers, but adaptive graph execution uses
+        # this bounded verifier path.
+        if self.review_pipeline == "bounded-v2" and self.review_mode == "adaptive_multi_agent":
+            return self.verifier_stage.run(self, state)
         if self.review_mode == "rules_only":
             return {"challenges": [], "challenge_outcomes": [],
                     "challenge_activation": {"triggered": False, "reasons": ["rules-only"]}}
@@ -2133,19 +2517,19 @@ class MultiAgentCoordinator(Reviewer):
 
         primary = next((item for item in self.agents
                         if getattr(item, "agent_role", "") == "primary"), None)
-        challenger = (
+        auditor = (
             primary if self.challenge_strategy == "self_reflect" else
             next((item for item in self.agents
-                  if getattr(item, "agent_role", "") == "challenger"), None)
+                  if getattr(item, "agent_role", "") == "auditor"), None)
         )
-        if challenger is None:
-            activation["reasons"].append("challenger-unavailable")
+        if auditor is None:
+            activation["reasons"].append("auditor-unavailable")
             return {"challenges": [], "challenge_outcomes": [],
                     "challenge_activation": activation}
-        if (self.challenge_strategy == "independent_challenger"
+        if (self.challenge_strategy == "independent_auditor"
                 and not state["shared_budget"].reserve("agent_runs", 1)):
             return {"challenges": [], "challenge_outcomes": [{
-                "status": "budget_exhausted", "agent": challenger.name,
+                "status": "budget_exhausted", "agent": auditor.name,
             }], "challenge_activation": activation}
 
         # For the narrow, structurally-adapted CWE families, multiple agents
@@ -2169,7 +2553,7 @@ class MultiAgentCoordinator(Reviewer):
             value.pop("proposer_run_id", None)
             blind_claims.append(value)
         assignment = ReviewAssignment(
-            agent=challenger.name,
+            agent=auditor.name,
             objective="Return an explicit support, refute or insufficient verdict for every claim.",
             files=list(state["parsed"].files),
             risk_domains=["security", "reliability", "correctness"],
@@ -2194,14 +2578,14 @@ class MultiAgentCoordinator(Reviewer):
         if self.challenge_strategy == "self_reflect":
             prior_execution = next((
                 item.get("execution") for item in state.get("agent_outcomes", [])
-                if item.get("agent") == challenger.name
+                if item.get("agent") == auditor.name
             ), None)
         outputs, attempts, error, execution = self._invoke_agent(
-            state, challenger, assignment, guidance, prior_execution,
+            state, auditor, assignment, guidance, prior_execution,
         )
         challenge_run_id = artifact_fingerprint({
             "task": state.get("task_id", ""), "assignment": assignment.assignment_id,
-            "agent": challenger.name, "snapshot": state.get("source_sha", ""),
+            "agent": auditor.name, "snapshot": state.get("source_sha", ""),
         })[:24]
         if self.challenge_strategy == "self_reflect":
             original = next((item for item in state.get("agent_runs", [])
@@ -2219,7 +2603,7 @@ class MultiAgentCoordinator(Reviewer):
                 "tool": observation.get("tool", ""),
                 "path": locator.get("path", ""),
                 "line": locator.get("line", locator.get("start_line", 0)),
-                "result": observation.get("result"), "agent": challenger.name,
+                "result": observation.get("result"), "agent": auditor.name,
                 "shard_id": "challenge",
                 "snapshot_id": observation.get("snapshot_id", ""),
                 "producer_run_id": observation.get("producer_run_id", ""),
@@ -2343,7 +2727,7 @@ class MultiAgentCoordinator(Reviewer):
 
         usage = execution.get("usage") or {}
         challenge_run = AgentRun(
-            challenge_run_id, self._agent_spec(challenger, assignment.assignment_id),
+            challenge_run_id, self._agent_spec(auditor, assignment.assignment_id),
             assignment.assignment_id, state.get("source_sha", ""),
             "completed" if not error else "failed", tuple(item.claim_id for item in challenges),
             int(execution.get("tool_calls", 0)), int(usage.get("llm_calls", 0)),
@@ -2379,7 +2763,7 @@ class MultiAgentCoordinator(Reviewer):
                 )
                 return
 
-        if self.challenge_strategy == "independent_challenger":
+        if self.challenge_strategy == "independent_auditor":
             runs.append(challenge_run)
         else:
             merge_phase(challenge_run_id, challenge_run)
@@ -2470,13 +2854,106 @@ class MultiAgentCoordinator(Reviewer):
             for item in challenges
         ]
         outcomes = [{
-            "agent": challenger.name, "status": "completed" if not error else "failed",
+            "agent": auditor.name, "status": "completed" if not error else "failed",
             "attempts": attempts, "error": error, "execution": execution,
-            "blind_context": self.challenge_strategy == "independent_challenger",
+            "blind_context": self.challenge_strategy == "independent_auditor",
         }] + revision_outcomes
         return {"challenges": state["challenges"], "challenge_outcomes": outcomes,
                 "agent_runs": runs, "claims": state["claims"],
                 "challenge_activation": activation}
+
+    def _run_batched_verifier(self, state: CollaborationState, batch_builder) -> Dict[str, Any]:
+        verifier = next((item for item in self.agents
+                        if getattr(item, "agent_role", "") == "verifier"
+                        and callable(getattr(item, "agent_step", None))), None)
+        if verifier is None:
+            return {"challenges": [], "challenge_outcomes": [], "verifier_batches": []}
+        claims = list(state.get("claims", []))
+        # Normalize display aliases before batching, keeping their claims so
+        # deterministic decision provenance is never discarded.
+        representatives = {}
+        for claim in claims:
+            representatives.setdefault((claim.path, claim.line, canonical_rule_id(claim.rule_id)), []).append(claim)
+        groups = list(representatives.values())
+        batches = batch_builder(groups)
+        if not batches:
+            return {"challenges": [], "challenge_outcomes": [], "verifier_batches": []}
+
+        def run_batch(index: int, groups_in_batch: List[List[Claim]]) -> dict:
+            batch_claims = [group[0] for group in groups_in_batch]
+            public = []
+            for claim in batch_claims:
+                value = claim.to_dict()
+                value.pop("proposer_run_id", None)
+                public.append(value)
+            assignment = ReviewAssignment(
+                agent=verifier.name, objective="Independently verify each candidate failure scenario.",
+                files=sorted({claim.path for claim in batch_claims}),
+                risk_domains=["security", "reliability", "correctness"],
+                assignment_id="verifier-%02d" % (index + 1), reason="verify-findings",
+                coverage_scope="verification",
+                budget=self.budget_policy.for_shard(sum(
+                    1 for line in state["parsed"].added_lines if line.path in {claim.path for claim in batch_claims}
+                )).to_dict(),
+            )
+            outcome = self._run_assignment(state, assignment, verifier, [
+                "Candidate claims (max 8): %s" % json.dumps(public, ensure_ascii=False, sort_keys=True),
+                "Return support, refute, or insufficient with fresh tool evidence for every claim.",
+            ])
+            outcome["claim_groups"] = groups_in_batch
+            return outcome
+
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(batches))) as pool:
+            futures = [pool.submit(run_batch, batch.index - 1, batch.claims) for batch in batches]
+            outcomes = [future.result() for future in futures]
+        challenges, runs = [], list(state.get("agent_runs", []))
+        for outcome in outcomes:
+            execution = outcome.get("execution") or {}
+            receipt = outcome.get("coverage_receipt")
+            if receipt:
+                state.setdefault("coverage_receipts", []).append(receipt)
+            if outcome.get("status") not in {"completed", "fallback"}:
+                for group in outcome["claim_groups"]:
+                    for claim in group:
+                        challenges.append(Challenge(claim.claim_id, "insufficient", "verifier budget or execution gap", "", ()))
+                state.setdefault("coverage_gaps", []).append({
+                    "assignment_id": outcome["assignment_id"], "files": list(outcome["assignment"].files),
+                    "reason": "verifier incomplete",
+                })
+                continue
+            raw = list(execution.get("pinned_evidence") or [])
+            raw.extend({"tool": item.get("tool", ""), "path": (item.get("locator") or {}).get("path", ""),
+                        "line": (item.get("locator") or {}).get("line", 0), "result": item.get("result", "")}
+                       for item in execution.get("observations", []) if item.get("ok"))
+            run_id = artifact_fingerprint({"task": state.get("task_id", ""), "assignment": outcome["assignment_id"],
+                                           "snapshot": state.get("source_sha", "")})[:24]
+            evidence = [evidence_from_record(item, state.get("source_sha", ""), run_id) for item in raw]
+            by_claim = {str(item.get("claim_id", "")): item for item in outcome.get("findings", []) if isinstance(item, dict)}
+            for group in outcome["claim_groups"]:
+                representative = group[0]
+                response = by_claim.get(representative.claim_id, {})
+                verdict = str(response.get("verdict", "insufficient")).lower()
+                if verdict not in {"support", "refute", "insufficient"}:
+                    verdict = "insufficient"
+                refs = tuple(item.evidence_id for item in evidence)
+                for claim in group:
+                    challenges.append(Challenge(claim.claim_id, verdict,
+                                                str(response.get("rationale", "fresh verifier evidence"))[:500],
+                                                run_id, refs))
+                    state.setdefault("claim_evidence", {}).setdefault(claim.claim_id, []).extend(
+                        [replace(item, claim_ids=(claim.claim_id,)) for item in evidence]
+                    )
+            usage = execution.get("usage") or {}
+            runs.append(AgentRun(run_id, self._agent_spec(verifier, outcome["assignment_id"]),
+                                 outcome["assignment_id"], state.get("source_sha", ""), "completed",
+                                 tuple(claim.claim_id for group in outcome["claim_groups"] for claim in group),
+                                 int(execution.get("tool_calls", 0)), int(usage.get("llm_calls", 0)),
+                                 int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)),
+                                 int(usage.get("cached_tokens", 0)), str(usage.get("usage_source", "estimated")), "",
+                                 *self._request_trace(execution)))
+        return {"challenges": challenges, "challenge_outcomes": outcomes, "agent_runs": runs,
+                "verifier_batches": [{"size": sum(len(group) for group in batch.claims)} for batch in batches],
+                "challenge_activation": {"triggered": True, "reasons": ["batched-verifier"]}}
 
     def _adaptive_decision_node(self, state: CollaborationState) -> Dict[str, Any]:
         decisions = []
@@ -2513,6 +2990,14 @@ class MultiAgentCoordinator(Reviewer):
                 "reason_codes": ["semantic-review-incomplete"],
                 "llm_failures": list(state.get("llm_failures") or []),
             })
+        coverage_incomplete = bool(state.get("coverage_gaps"))
+        if coverage_incomplete:
+            escalations.append({
+                "kind": "coverage-incomplete",
+                "reason_codes": ["required-hunk-coverage-incomplete"],
+                "coverage_gaps": list(state.get("coverage_gaps") or []),
+                "verdict_cap": "needs-human-review",
+            })
         # Keep every immutable Claim and Decision above, but collapse aliases
         # at the user-facing Finding boundary.  A semantic Agent may call the
         # same defect CWE-703 while the rule scanner calls it
@@ -2547,6 +3032,7 @@ class MultiAgentCoordinator(Reviewer):
         return {
             "verified": verified, "adaptive_decisions": decisions,
             "escalations": escalations, "adaptive_rejected": rejected,
+            "coverage_gate": "needs-human-review" if coverage_incomplete else "clear",
         }
 
     def _deliberation_node(self, state: CollaborationState) -> Dict[str, Any]:
@@ -2880,12 +3366,24 @@ class MultiAgentCoordinator(Reviewer):
             "visible_added_lines": visible_added,
             "omitted_added_lines": omitted_added,
             "coverage_gaps": list(state.get("coverage_gaps") or []),
+            "coverage_receipts": list(state.get("coverage_receipts") or []),
+            "budget_gaps": list(state.get("budget_gaps") or []),
+            "global_budget": state["shared_budget"].snapshot(),
+            "verifier_batches": list(state.get("verifier_batches") or []),
+            "auditor_rounds": list(state.get("audit_rounds") or []),
+            "coverage_repairs": [
+                {"assignment_id": item["assignment_id"],
+                 "required_hunk_ids": list(item["assignment"].required_hunk_ids)}
+                for item in state.get("coverage_repair_outcomes", [])
+            ],
             "coverage_status": "complete" if not state.get("coverage_gaps") and len(reviewed) == len(state["parsed"].files) else "partial",
             "review_complete": not state.get("coverage_gaps") and len(reviewed) == len(state["parsed"].files),
+            "verdict_cap": state.get("coverage_gate", "clear"),
             "specialist_activation": self.specialist_activation,
             "shard_assignments": assignment_matrix,
             "llm_failures": list(state.get("llm_failures") or []),
             "cross_shard_findings": len(state.get("cross_shard_findings") or []),
+            "cross_shard_execution": dict(cross_execution),
             "repo_tool_calls": sum(int((item.get("execution") or {}).get("repo_tool_calls", 0)) for item in outcomes) + int(cross_execution.get("repo_tool_calls", 0)),
             "retrieved_context_tokens": sum(int((item.get("execution") or {}).get("retrieved_context_tokens", 0)) for item in outcomes) + int(cross_execution.get("retrieved_context_tokens", 0)),
             "dropped_observations": sum(int((item.get("execution") or {}).get("dropped_observations", 0)) for item in outcomes),

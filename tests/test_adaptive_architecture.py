@@ -162,27 +162,27 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         self.assertEqual({"type": "disabled"}, captured["thinking"])
         self.assertTrue(reviewer.disable_thinking)
 
-    def test_blind_challenger_is_not_offered_locator_only_tools(self):
+    def test_blind_auditor_is_not_offered_locator_only_tools(self):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+return allowed\n"
         parsed = parse_unified_diff(diff)
         primary = ProtocolAgent("primary", [finding()])
 
-        class CatalogChallenger(ProtocolAgent):
+        class CatalogAuditor(ProtocolAgent):
             def agent_step(self, state):
                 names = {item["name"] for item in state.get("available_tools", [])}
                 self.catalog = names
                 return super().agent_step(state)
 
-        challenger = CatalogChallenger("challenger")
+        auditor = CatalogAuditor("auditor")
         coordinator = MultiAgentCoordinator(
-            [primary, challenger], review_mode="adaptive_multi_agent", max_workers=1,
+            [primary, auditor], review_mode="adaptive_multi_agent", max_workers=1,
             snapshot_provider=InMemorySnapshotProvider({"a.py": "return allowed\n"}),
         )
         coordinator.review_with_execution_context(
-            "challenger-tools", diff, parsed, {"force_challenge": True}, source_sha="sha",
+            "auditor-tools", diff, parsed, {"force_challenge": True}, source_sha="sha",
         )
-        self.assertTrue({"read_file", "find_symbol", "find_references"}.issubset(challenger.catalog))
-        self.assertTrue({"read_diff", "search_diff", "changed_line"}.isdisjoint(challenger.catalog))
+        self.assertTrue({"read_file", "find_symbol", "find_references"}.issubset(auditor.catalog))
+        self.assertTrue({"read_diff", "search_diff", "changed_line"}.isdisjoint(auditor.catalog))
 
     def test_stage_budget_is_terminal_and_failed_run_keeps_partial_usage(self):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+return allowed\n"
@@ -323,7 +323,7 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         context = LoopContext()
         observation = {"tool": "read_file", "ok": True,
                        "result": '{"path":"a.py","content":"x"}',
-                       "agent": "challenger", "shard_id": "full"}
+                       "agent": "auditor", "shard_id": "full"}
         context.add_round(1, {"action": "tool"}, observation)
         active = context.render()["active_rounds"][0]["observation"]
         self.assertEqual("R1", active["evidence_alias"])
@@ -336,14 +336,14 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         context.add_round(1, {"action": "tool"}, {
             "tool": "grep_repo", "ok": True,
             "result": '[{"path":"src/api.py","line":1}]',
-            "agent": "challenger", "shard_id": "full",
+            "agent": "auditor", "shard_id": "full",
         })
         context.pin(["R1"], "claim")
         evidence = context.render()["pinned_evidence"][0]
         self.assertEqual("src/api.py", evidence["path"])
         self.assertEqual(1, evidence["line"])
 
-    def test_clean_challenger_must_investigate_before_final(self):
+    def test_clean_auditor_must_investigate_before_final(self):
         reviewer = OpenAICompatibleReviewer(
             "https://model.example/v1", "secret", "model", provider="test",
         )
@@ -407,7 +407,7 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         context.add_round(1, {"action": "tool"}, {
             "tool": "find_symbol", "ok": True,
             "result": '{"symbol":"charge","hits":[{"path":"src/api.py","line":1}]}',
-            "agent": "challenger", "shard_id": "full",
+            "agent": "auditor", "shard_id": "full",
         })
         context.pin(["R1"], "claim")
         evidence = context.render()["pinned_evidence"][0]
@@ -466,9 +466,9 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+return allowed\n"
         parsed = parse_unified_diff(diff)
         primary = ProtocolAgent("primary", [finding()], revision_action="withdraw")
-        challenger = ProtocolAgent("challenger", challenge_verdict="refute")
+        auditor = ProtocolAgent("auditor", challenge_verdict="refute")
         coordinator = MultiAgentCoordinator(
-            [primary, challenger], review_mode="adaptive_multi_agent", max_workers=1,
+            [primary, auditor], review_mode="adaptive_multi_agent", max_workers=1,
             snapshot_provider=InMemorySnapshotProvider({"a.py": "return allowed\n"}),
         )
         results = coordinator.review_with_execution_context(
@@ -486,9 +486,9 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         security = ProtocolAgent("security", [finding("CWE-863", path="a.py",
                                                        evidence="eval(payload)")],
                                  revision_action="withdraw")
-        challenger = ProtocolAgent("challenger", challenge_verdict="insufficient")
+        auditor = ProtocolAgent("auditor", challenge_verdict="insufficient")
         coordinator = MultiAgentCoordinator(
-            [SecurityRuleReviewer(), primary, security, challenger],
+            [SecurityRuleReviewer(), primary, security, auditor],
             review_mode="adaptive_multi_agent", max_workers=1,
             snapshot_provider=InMemorySnapshotProvider({"a.py": "eval(payload)\n"}),
         )
@@ -513,9 +513,9 @@ class AdaptiveArchitectureTests(unittest.TestCase):
             "CWE-863", Severity.HIGH, "a.py", 1,
             "return user.is_authenticated", "tenant authorization bypass",
         )])
-        challenger = ProtocolAgent("challenger", challenge_verdict="support")
+        auditor = ProtocolAgent("auditor", challenge_verdict="support")
         coordinator = MultiAgentCoordinator(
-            [primary, security, challenger], review_mode="adaptive_multi_agent", max_workers=1,
+            [primary, security, auditor], review_mode="adaptive_multi_agent", max_workers=1,
             snapshot_provider=InMemorySnapshotProvider({
                 "a.py": "return user.is_authenticated\n",
             }),
@@ -579,7 +579,7 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         claim = Claim.from_finding(f, "agent", "agent")
         evidence = Evidence("E:1", "sha", "a.py", 1, "read_file", "read_file",
                             "agent", "d", "tool", (claim.claim_id,))
-        support = Challenge(claim.claim_id, "support", "claimed bypass", "challenger", ("E:1",))
+        support = Challenge(claim.claim_id, "support", "claimed bypass", "auditor", ("E:1",))
         decision = AdaptiveDecisionPolicy().decide(claim, f, parsed, [evidence], [support], "sha")
         self.assertEqual("reject", decision.outcome)
         self.assertEqual(("not-executable-structure",), decision.reason_codes)
@@ -617,9 +617,9 @@ class AdaptiveArchitectureTests(unittest.TestCase):
             "-    return charge(user, amount)\n+    return charge(user, amount, currency)\n"
         )
         primary = ProtocolAgent("primary")
-        challenger = ProtocolAgent("challenger", challenge_verdict="support")
+        auditor = ProtocolAgent("auditor", challenge_verdict="support")
         coordinator = MultiAgentCoordinator(
-            [primary, challenger], review_mode="adaptive_multi_agent",
+            [primary, auditor], review_mode="adaptive_multi_agent",
             snapshot_provider=InMemorySnapshotProvider({
                 "src/caller.py": "def checkout():\n    return charge(user, amount, currency)\n",
                 "src/api.py": "def charge(user, amount):\n    return True\n",
@@ -749,7 +749,7 @@ class AdaptiveArchitectureTests(unittest.TestCase):
     def test_contracts_are_immutable_and_evidence_ids_are_content_addressed(self):
         spec = AgentSpec("a", "primary")
         with self.assertRaises(FrozenInstanceError):
-            spec.role = "challenger"
+            spec.role = "auditor"
         one = evidence_from_record({"tool": "read_file", "path": "a.py", "line": 1,
                                     "result": "x"}, "sha", "run-a")
         two = evidence_from_record({"tool": "read_file", "path": "a.py", "line": 1,
@@ -781,11 +781,11 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         f = finding()
         claim = Claim.from_finding(f, "run", "agent")
         stale = Evidence("E:1", "old-sha", "a.py", 1, "read_file", "read_file", "run", "d", "tool")
-        support = Challenge(claim.claim_id, "support", "checked", "challenger", ("E:1",))
+        support = Challenge(claim.claim_id, "support", "checked", "auditor", ("E:1",))
         decision = AdaptiveDecisionPolicy().decide(claim, f, parsed, [stale], [support], "new-sha")
         self.assertEqual(("stale-snapshot-evidence",), decision.reason_codes)
         current = Evidence("E:2", "new-sha", "a.py", 1, "read_file", "read_file", "run", "d", "tool")
-        refute = Challenge(claim.claim_id, "refute", "safe branch", "challenger", ("E:2",))
+        refute = Challenge(claim.claim_id, "refute", "safe branch", "auditor", ("E:2",))
         self.assertEqual("reject", AdaptiveDecisionPolicy().decide(claim, f, parsed, [current], [refute], "new-sha").outcome)
 
     def test_high_risk_semantic_claim_fails_closed_without_challenge(self):
@@ -832,31 +832,31 @@ class AdaptiveArchitectureTests(unittest.TestCase):
             "E:other", "sha", "unrelated.py", 1, "read_file", "read_file",
             "primary", "digest", "tool", (claim.claim_id,), result_nonempty=True,
         )
-        support = Challenge(claim.claim_id, "support", "checked", "challenger", ("E:other",))
+        support = Challenge(claim.claim_id, "support", "checked", "auditor", ("E:other",))
         decision = AdaptiveDecisionPolicy().decide(
             claim, value, parsed, [unrelated], [support], "sha",
         )
         self.assertEqual("escalate", decision.outcome)
         self.assertIn("semantic-evidence-required", decision.reason_codes)
 
-    def test_conditional_challenger_ignores_self_declared_high_without_router_risk(self):
+    def test_conditional_auditor_ignores_self_declared_high_without_router_risk(self):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+return balance - amount\n"
         parsed = parse_unified_diff(diff)
         primary = ProtocolAgent("primary", [finding(
             "CWE-840", Severity.HIGH, "a.py", 1,
             "return balance - amount", "business balance invariant may be violated",
         )])
-        challenger = ProtocolAgent("challenger", challenge_verdict="support")
+        auditor = ProtocolAgent("auditor", challenge_verdict="support")
         coordinator = MultiAgentCoordinator(
-            [primary, challenger], review_mode="adaptive_multi_agent", max_workers=1,
+            [primary, auditor], review_mode="adaptive_multi_agent", max_workers=1,
             snapshot_provider=InMemorySnapshotProvider({"a.py": "return balance - amount\n"}),
         )
         coordinator.review_with_context("conditional-low-risk", diff, parsed, source_sha="sha")
         summary = coordinator.collaboration_summary("conditional-low-risk")
         self.assertFalse(summary["challenge_activation"]["triggered"])
-        self.assertFalse(challenger.contexts)
+        self.assertFalse(auditor.contexts)
 
-    def test_conditional_challenger_runs_for_admitted_router_confirmed_risk(self):
+    def test_conditional_auditor_runs_for_admitted_router_confirmed_risk(self):
         class AuthRiskScanner(Reviewer):
             name = "auth-risk-scanner"
             execution_kind = "deterministic-checker"
@@ -873,9 +873,9 @@ class AdaptiveArchitectureTests(unittest.TestCase):
             "CWE-863", Severity.HIGH, "auth.py", 1,
             "return user.is_authenticated", "authorization ownership check is bypassed",
         )])
-        challenger = ProtocolAgent("challenger", challenge_verdict="support")
+        auditor = ProtocolAgent("auditor", challenge_verdict="support")
         coordinator = MultiAgentCoordinator(
-            [AuthRiskScanner(), primary, challenger], review_mode="adaptive_multi_agent",
+            [AuthRiskScanner(), primary, auditor], review_mode="adaptive_multi_agent",
             max_workers=1,
             snapshot_provider=InMemorySnapshotProvider({"auth.py": "return user.is_authenticated\n"}),
         )
@@ -884,7 +884,7 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         self.assertTrue(summary["challenge_activation"]["triggered"])
         self.assertIn("admitted-high-risk", summary["challenge_activation"]["reasons"])
         self.assertTrue(any(
-            (run.get("spec") or {}).get("role") == "challenger"
+            (run.get("spec") or {}).get("role") == "auditor"
             for run in summary["agent_runs"]
         ))
 
@@ -933,9 +933,9 @@ class AdaptiveArchitectureTests(unittest.TestCase):
             "CWE-95", Severity.CRITICAL, "a.py", 1, "eval(payload)",
             "untrusted payload reaches dynamic execution",
         )])
-        challenger = ProtocolAgent("challenger", challenge_verdict="support")
+        auditor = ProtocolAgent("auditor", challenge_verdict="support")
         coordinator = MultiAgentCoordinator(
-            [SecurityRuleReviewer(), primary, challenger],
+            [SecurityRuleReviewer(), primary, auditor],
             review_mode="adaptive_multi_agent", max_workers=1,
             snapshot_provider=InMemorySnapshotProvider({"a.py": "eval(payload)\n"}),
         )
@@ -964,19 +964,19 @@ class AdaptiveArchitectureTests(unittest.TestCase):
         self.assertTrue(security.contexts)
         self.assertFalse(reliability.contexts)
 
-    def test_blind_challenger_context_omits_identity_confidence_and_memory(self):
+    def test_blind_auditor_context_omits_identity_confidence_and_memory(self):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+return allowed\n"
         parsed = parse_unified_diff(diff)
         primary_finding = finding()
-        primary, challenger = ProbeAgent("primary", [primary_finding]), ProbeAgent("challenger", [primary_finding])
+        primary, auditor = ProbeAgent("primary", [primary_finding]), ProbeAgent("auditor", [primary_finding])
         coordinator = MultiAgentCoordinator(
-            [primary, challenger], review_mode="adaptive_multi_agent", max_workers=1,
+            [primary, auditor], review_mode="adaptive_multi_agent", max_workers=1,
             snapshot_provider=InMemorySnapshotProvider({"a.py": "return allowed\n"}),
         )
         coordinator.review_with_execution_context(
             "blind", diff, parsed, {"force_challenge": True}, source_sha="sha",
         )
-        combined = "\n".join(challenger.contexts)
+        combined = "\n".join(auditor.contexts)
         self.assertNotIn("proposer_run_id", combined)
         self.assertNotIn('"confidence":', combined.lower())
         self.assertNotIn("working memory", combined.lower())

@@ -96,6 +96,9 @@ class Settings:
     # configured. ReviewService still resolves this to rules_only when no LLM
     # endpoint is available or LLM usage is disabled.
     review_mode: str = "adaptive_multi_agent"
+    # The bounded graph gives verification and reverse audit separate agents.
+    # Keep the legacy topology available as an explicit compatibility switch.
+    review_pipeline: str = "bounded-v2"
     agent_budget_max_runs: int = 4
     agent_budget_max_llm_calls: int = 12
     agent_budget_max_tool_calls: int = 24
@@ -286,6 +289,8 @@ class Settings:
             raise ValueError(
                 "EVOAGENT_REVIEW_MODE must be rules_only, single_agent or adaptive_multi_agent"
             )
+        if self.review_pipeline not in {"classic", "bounded-v2"}:
+            raise ValueError("EVOAGENT_REVIEW_PIPELINE must be classic or bounded-v2")
         for name, value in (
             ("EVOAGENT_AGENT_BUDGET_MAX_RUNS", self.agent_budget_max_runs),
             ("EVOAGENT_AGENT_BUDGET_MAX_LLM_CALLS", self.agent_budget_max_llm_calls),
@@ -338,6 +343,7 @@ class Settings:
             llm_request_timeout_seconds=_int("EVOAGENT_LLM_REQUEST_TIMEOUT_SECONDS", 60),
             llm_mode=os.getenv("EVOAGENT_LLM_MODE", "controlled").strip().lower(),
             review_mode=os.getenv("EVOAGENT_REVIEW_MODE", "adaptive_multi_agent").strip().lower(),
+            review_pipeline=os.getenv("EVOAGENT_REVIEW_PIPELINE", "bounded-v2").strip().lower(),
             agent_budget_max_runs=_int("EVOAGENT_AGENT_BUDGET_MAX_RUNS", 4),
             agent_budget_max_llm_calls=_int("EVOAGENT_AGENT_BUDGET_MAX_LLM_CALLS", 12),
             agent_budget_max_tool_calls=_int("EVOAGENT_AGENT_BUDGET_MAX_TOOL_CALLS", 24),
